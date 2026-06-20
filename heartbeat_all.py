@@ -50,6 +50,12 @@ def beat(conn: psycopg.Connection, n: dict) -> dict:
             "vram_free_mib": stats.get("vram_free_mib"), "note": note}
 
 
+PRUNE = """
+DELETE FROM gpu_slots
+WHERE (node, slot_id) NOT IN (SELECT node, slot_id FROM fleet_nodes WHERE enabled)
+"""
+
+
 def tick(conn: psycopg.Connection) -> list[dict]:
     nodes = [dict(zip(COLS, r)) for r in conn.execute(FETCH).fetchall()]
     out = []
@@ -59,6 +65,10 @@ def tick(conn: psycopg.Connection) -> list[dict]:
         except Exception as exc:  # one node's failure never stops the others
             conn.rollback()
             out.append({"node": n["node"], "alive": False, "error": str(exc)})
+    # Autonomous decommission: drop directory rows we no longer track (node
+    # removed or disabled in fleet_nodes), so a retired node fully disappears.
+    conn.execute(PRUNE)
+    conn.commit()
     return out
 
 
