@@ -74,7 +74,10 @@ this insert — the human is out of the loop.
 ## v1 scope (this spine) vs later
 
 **Done:** directory table, decode-probe heartbeat, capability `pick` with
-`SKIP LOCKED`, 45 s TTL membership, interactive/batch classes.
+`SKIP LOCKED`, 45 s TTL membership, interactive/batch classes, **concurrent
+fast-fail probing** (nodes probed in parallel and each row committed the moment
+its probe lands, so one slow/black-hole node can't stall the tick and age the
+healthy nodes out of `live_slots`).
 
 **Next:** real slot leases (decrement/restore `free_slots` per claim, deadman
 expiry) so K-fan-out is exclusive, not advisory · `di` wired to `pick` instead of

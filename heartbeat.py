@@ -47,11 +47,11 @@ ON CONFLICT (node, endpoint_url, slot_id) DO UPDATE SET
 """
 
 
-def gpu_stats(gpu_cmd: str) -> dict | None:
+def gpu_stats(gpu_cmd: str, timeout: float = 20) -> dict | None:
     """Run nvidia-smi (local or via ssh) and parse the first GPU's stats."""
     argv = shlex.split(gpu_cmd) + [GPU_QUERY, GPU_FORMAT]
     try:
-        out = subprocess.run(argv, capture_output=True, text=True, timeout=20, check=True)
+        out = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=True)
     except (subprocess.SubprocessError, OSError) as exc:
         return {"_error": f"gpu_stats: {exc}"}
     line = out.stdout.strip().splitlines()
