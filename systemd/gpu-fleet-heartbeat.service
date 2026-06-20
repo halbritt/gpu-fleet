@@ -1,0 +1,14 @@
+[Unit]
+Description=gpu-fleet heartbeat (keeps the GPU registry live, no human intervention)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/halbritt/git/gpu-fleet
+ExecStart=/usr/bin/python3 /home/halbritt/git/gpu-fleet/heartbeat_all.py --interval 15
+Restart=always
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=default.target

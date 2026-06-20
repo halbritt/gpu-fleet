@@ -46,6 +46,31 @@ python3 heartbeat.py --node peecee --endpoint http://peecee:11434/v1 \
 python3 pick_slot.py --latency-class batch -k 4 --json
 ```
 
+## Install (autonomous — no human intervention)
+
+```bash
+psql -d gpu_fleet -f migrations/001_gpu_slots.sql
+psql -d gpu_fleet -f migrations/002_fleet_nodes.sql       # declares the fleet members
+
+# heartbeat driver as a self-restarting user service (survives reboot via linger):
+cp systemd/gpu-fleet-heartbeat.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now gpu-fleet-heartbeat
+
+# di auto-routes onto a live batch slot (no manual endpoint):
+cp bin/di-fleet ~/.local/bin/ && chmod +x ~/.local/bin/di-fleet
+di-fleet "your problem" --json
+```
+
+**Growing the fleet needs no code change** — insert a row:
+```sql
+INSERT INTO fleet_nodes (node, endpoint_url, served_model, latency_class, gpu_cmd, max_context, nvlink_domain)
+VALUES ('quad-a', 'http://quad:8081/v1', 'qwen3.6-35b-a3b', 'batch',
+        'ssh -o BatchMode=yes quad nvidia-smi', 262144, 'quad-pair-0');
+```
+It is live on the next heartbeat tick; a node that goes silent (probe fails) ages
+out of `live_slots` automatically. An agent or a node's boot-time join-script does
+this insert — the human is out of the loop.
+
 ## v1 scope (this spine) vs later
 
 **Done:** directory table, decode-probe heartbeat, capability `pick` with

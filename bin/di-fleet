@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# di-fleet: run `di` (divergent-ideation) on a live fleet BATCH slot automatically.
+# No manual DIVERGENT_LLM_BASE_URL/MODEL. Prefers a batch (ideation) node, falls
+# back to any live slot, then to di's own default if the fleet is empty.
+set -uo pipefail
+FLEET=/home/halbritt/git/gpu-fleet
+DI_CLI=/home/halbritt/git/divergent-ideation/dist/cli.js
+
+route() { python3 "$FLEET/pick_slot.py" "$@" -k 1 --json 2>/dev/null || echo '[]'; }
+
+pick=$(route --latency-class batch)
+[ "$(jq -r 'length' <<<"${pick:-[]}" 2>/dev/null || echo 0)" = "0" ] && pick=$(route)
+
+endpoint=$(jq -r '.[0].endpoint_url // empty' <<<"${pick:-[]}" 2>/dev/null)
+model=$(jq -r '.[0].served_model // empty' <<<"${pick:-[]}" 2>/dev/null)
+
+if [ -n "$endpoint" ]; then
+  echo "di-fleet -> $endpoint ($model)" >&2
+  export DIVERGENT_LLM_BASE_URL="$endpoint"
+  export DIVERGENT_LLM_MODEL="$model"
+else
+  echo "di-fleet: no live fleet slot; using di defaults (localhost:8081)" >&2
+fi
+exec node "$DI_CLI" "$@"
