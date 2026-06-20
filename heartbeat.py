@@ -84,18 +84,36 @@ def decode_probe(endpoint: str, model: str, timeout: float) -> tuple[bool, int |
     return bool(d.get("choices")), ms, None
 
 
+def discover_served_model(endpoint: str, fallback: str | None, timeout: float = 6.0) -> str | None:
+    """Self-correct the served model from the endpoint.
+
+    If the endpoint serves exactly ONE model (the llama-server case), report it —
+    so a node swapped from ollama to llama-server auto-updates with no reconfig.
+    If it lists many (the ollama case), keep the configured tag and don't disrupt
+    by probe-loading some arbitrary big model.
+    """
+    url = endpoint.rstrip("/") + "/models"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            ids = [m.get("id") for m in json.load(r).get("data", []) if m.get("id")]
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, TimeoutError):
+        return fallback
+    return ids[0] if len(ids) == 1 else fallback
+
+
 def heartbeat_once(conn: psycopg.Connection, args) -> dict:
     stats = gpu_stats(args.gpu_cmd) or {}
     gpu_err = stats.pop("_error", None)
-    alive, probe_ms, probe_err = decode_probe(args.endpoint, args.probe_model, args.timeout)
+    served = discover_served_model(args.endpoint, args.served_model)
+    alive, probe_ms, probe_err = decode_probe(args.endpoint, served or args.probe_model, args.timeout)
     note = "; ".join(x for x in (gpu_err, probe_err) if x) or None
     row = {
         "node": args.node, "endpoint": args.endpoint, "slot_id": args.slot_id,
         "gpu_model": stats.get("gpu_model"), "nvlink": args.nvlink_domain,
         "vram_total": stats.get("vram_total_mib"), "vram_free": stats.get("vram_free_mib"),
         "util": stats.get("gpu_util_pct"),
-        "loaded_model": args.probe_model if alive else None,
-        "served_model": args.served_model, "max_context": args.max_context,
+        "loaded_model": served if alive else None,
+        "served_model": served, "max_context": args.max_context,
         "latency_class": args.latency_class, "free_slots": args.free_slots,
         "epoch": args.epoch, "alive": alive, "probe_ms": probe_ms, "note": note,
     }

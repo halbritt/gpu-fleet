@@ -18,7 +18,7 @@ import time
 
 import psycopg
 
-from heartbeat import UPSERT, decode_probe, gpu_stats
+from heartbeat import UPSERT, decode_probe, discover_served_model, gpu_stats
 
 FETCH = """
 SELECT node, slot_id, endpoint_url, served_model, probe_model, latency_class,
@@ -32,16 +32,16 @@ COLS = ["node", "slot_id", "endpoint_url", "served_model", "probe_model",
 def beat(conn: psycopg.Connection, n: dict) -> dict:
     stats = gpu_stats(n["gpu_cmd"]) or {}
     gpu_err = stats.pop("_error", None)
-    probe_model = n["probe_model"] or n["served_model"]
-    alive, probe_ms, probe_err = decode_probe(n["endpoint_url"], probe_model, 30.0)
+    served = discover_served_model(n["endpoint_url"], n["probe_model"] or n["served_model"])
+    alive, probe_ms, probe_err = decode_probe(n["endpoint_url"], served, 30.0)
     note = "; ".join(x for x in (gpu_err, probe_err) if x) or None
     conn.execute(UPSERT, {
         "node": n["node"], "endpoint": n["endpoint_url"], "slot_id": n["slot_id"],
         "gpu_model": stats.get("gpu_model"), "nvlink": n["nvlink_domain"],
         "vram_total": stats.get("vram_total_mib"), "vram_free": stats.get("vram_free_mib"),
         "util": stats.get("gpu_util_pct"),
-        "loaded_model": probe_model if alive else None,
-        "served_model": n["served_model"], "max_context": n["max_context"],
+        "loaded_model": served if alive else None,
+        "served_model": served, "max_context": n["max_context"],
         "latency_class": n["latency_class"], "free_slots": n["free_slots"],
         "epoch": n["epoch"], "alive": alive, "probe_ms": probe_ms, "note": note,
     })
