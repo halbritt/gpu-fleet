@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
-# di-fleet: run `di` (divergent-ideation) on a live fleet BATCH slot automatically.
-# No manual DIVERGENT_LLM_BASE_URL/MODEL. Prefers a batch (ideation) node, falls
-# back to any live slot, then to di's own default if the fleet is empty.
+# di-fleet: run `di` (divergent-ideation) on a live fleet MoE slot automatically.
+# No manual DIVERGENT_LLM_BASE_URL/MODEL. Picks a live LLM by capability, prefers
+# a decode-verified warm slot, falls back to di's own default if the fleet is empty.
 set -uo pipefail
 FLEET=/home/halbritt/git/gpu-fleet
 DI_CLI=/home/halbritt/git/divergent-ideation/dist/cli.js
 
 route() { python3 "$FLEET/pick_slot.py" "$@" -k 8 --json 2>/dev/null || echo '[]'; }
-# di needs an OpenAI-compatible HTTP LLM endpoint. The batch lane can also hold
-# non-LLM capability slots (e.g. marker's ssh:// document-conversion endpoint),
-# so filter to http(s) and never route an ideation prompt at one of those.
-first_llm() { jq -c '[.[] | select(.endpoint_url | test("^https?://"))][0] // empty'; }
-
-pick=$(route --latency-class batch | first_llm)   # prefer a batch (ideation) LLM
-[ -z "$pick" ] && pick=$(route | first_llm)        # else any live LLM (e.g. proximal MoE)
+# di needs an OpenAI-compatible HTTP LLM endpoint -- never a non-LLM capability
+# slot (e.g. marker's ssh:// endpoint), so filter to http(s). Then prefer a
+# decode-verified WARM slot (real probe_ms) over a capability-only/cold one, so di
+# lands on a ready MoE instead of cold-loading a 23 GiB model that may be sharing
+# its GPU with marker.
+pick_llm() {
+  jq -c '([ .[] | select((.endpoint_url|test("^https?://")) and .probe_ms != null) ]
+        + [ .[] | select(  .endpoint_url|test("^https?://") ) ])[0] // empty'
+}
+pick=$(route | pick_llm)
 
 endpoint=$(jq -r '.endpoint_url // empty' <<<"${pick:-}" 2>/dev/null)
 model=$(jq -r '.served_model // empty' <<<"${pick:-}" 2>/dev/null)
