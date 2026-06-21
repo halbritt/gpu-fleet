@@ -21,6 +21,13 @@ single point of failure.
 - **Mechanism here, policy in the consumer.** The table knows only what exists
   and whether it is alive. Each consumer (di, praxis, ingest) carries its own
   policy and claims with its own `pick`.
+- **Non-LLM capabilities.** A slot need not be an OpenAI decode endpoint. Set
+  `probe_model = '-'` (sentinel; also `none`/`gpu-only`) and the heartbeat treats
+  **GPU reachability** (nvidia-smi) as liveness — it skips the decode-probe, which
+  for a non-LLM job would needlessly load a model and fight it for VRAM. Example:
+  `served_model = 'marker'` on peecee (GPU document→markdown via surya); consumers
+  request the `marker` capability, resolve the host from the `ssh://…` endpoint,
+  and run the conversion bridge.
 
 ## Tables
 

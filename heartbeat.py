@@ -104,8 +104,14 @@ def discover_served_model(endpoint: str, fallback: str | None, timeout: float = 
 def heartbeat_once(conn: psycopg.Connection, args) -> dict:
     stats = gpu_stats(args.gpu_cmd) or {}
     gpu_err = stats.pop("_error", None)
-    served = discover_served_model(args.endpoint, args.served_model)
-    alive, probe_ms, probe_err = decode_probe(args.endpoint, served or args.probe_model, args.timeout)
+    if (args.probe_model or args.served_model) in ("-", "none", "gpu-only"):
+        # Non-LLM capability (e.g. marker): liveness is GPU reachability, not a
+        # decode-probe (which would needlessly load a model / fight a running job).
+        served = args.served_model
+        alive, probe_ms, probe_err = (gpu_err is None and stats.get("gpu_model") is not None), None, None
+    else:
+        served = discover_served_model(args.endpoint, args.served_model)
+        alive, probe_ms, probe_err = decode_probe(args.endpoint, served or args.probe_model, args.timeout)
     note = "; ".join(x for x in (gpu_err, probe_err) if x) or None
     row = {
         "node": args.node, "endpoint": args.endpoint, "slot_id": args.slot_id,

@@ -44,9 +44,17 @@ def probe_node(n: dict) -> dict:
     the caller owns the single DB connection and does the write."""
     stats = gpu_stats(n["gpu_cmd"], GPU_TIMEOUT) or {}
     gpu_err = stats.pop("_error", None)
-    served = discover_served_model(
-        n["endpoint_url"], n["probe_model"] or n["served_model"], DISCOVER_TIMEOUT)
-    alive, probe_ms, probe_err = decode_probe(n["endpoint_url"], served, PROBE_TIMEOUT)
+    if (n["probe_model"] or n["served_model"]) in ("-", "none", "gpu-only"):
+        # Non-LLM capability (e.g. marker): liveness is GPU reachability, not an
+        # LLM decode-probe. A decode-probe here would needlessly load a model and,
+        # for a node mid document-conversion, fight that job for VRAM.
+        served = n["served_model"]
+        alive = gpu_err is None and stats.get("gpu_model") is not None
+        probe_ms, probe_err = None, None
+    else:
+        served = discover_served_model(
+            n["endpoint_url"], n["probe_model"] or n["served_model"], DISCOVER_TIMEOUT)
+        alive, probe_ms, probe_err = decode_probe(n["endpoint_url"], served, PROBE_TIMEOUT)
     note = "; ".join(x for x in (gpu_err, probe_err) if x) or None
     return {
         "node": n["node"], "endpoint": n["endpoint_url"], "slot_id": n["slot_id"],
