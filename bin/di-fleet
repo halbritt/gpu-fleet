@@ -6,13 +6,17 @@ set -uo pipefail
 FLEET=/home/halbritt/git/gpu-fleet
 DI_CLI=/home/halbritt/git/divergent-ideation/dist/cli.js
 
-route() { python3 "$FLEET/pick_slot.py" "$@" -k 1 --json 2>/dev/null || echo '[]'; }
+route() { python3 "$FLEET/pick_slot.py" "$@" -k 8 --json 2>/dev/null || echo '[]'; }
+# di needs an OpenAI-compatible HTTP LLM endpoint. The batch lane can also hold
+# non-LLM capability slots (e.g. marker's ssh:// document-conversion endpoint),
+# so filter to http(s) and never route an ideation prompt at one of those.
+first_llm() { jq -c '[.[] | select(.endpoint_url | test("^https?://"))][0] // empty'; }
 
-pick=$(route --latency-class batch)
-[ "$(jq -r 'length' <<<"${pick:-[]}" 2>/dev/null || echo 0)" = "0" ] && pick=$(route)
+pick=$(route --latency-class batch | first_llm)   # prefer a batch (ideation) LLM
+[ -z "$pick" ] && pick=$(route | first_llm)        # else any live LLM (e.g. proximal MoE)
 
-endpoint=$(jq -r '.[0].endpoint_url // empty' <<<"${pick:-[]}" 2>/dev/null)
-model=$(jq -r '.[0].served_model // empty' <<<"${pick:-[]}" 2>/dev/null)
+endpoint=$(jq -r '.endpoint_url // empty' <<<"${pick:-}" 2>/dev/null)
+model=$(jq -r '.served_model // empty' <<<"${pick:-}" 2>/dev/null)
 
 if [ -n "$endpoint" ]; then
   echo "di-fleet -> $endpoint ($model)" >&2
