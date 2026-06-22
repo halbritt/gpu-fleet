@@ -46,7 +46,7 @@
     "require_disjoint_write_scopes": true
   },
   "cycles": [
-    {"from": "review", "to": "draft", "on_verdict": "needs_revision", "max_iterations": 1}
+    {"from": "review", "to": "draft", "on_verdict": "needs_revision", "max_iterations": 2}
   ],
   "edges": [
     {"from": "draft", "to": "review", "on": "completed"},
