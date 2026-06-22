@@ -7,9 +7,13 @@ concurrency, failover, merge — with an INJECTED fake shard-runner (like `probe
 in test_probe_all). No real subprocess, DB, or HTTP touches these tests.
 """
 
+import json
 import time
 
+import pytest
+
 import di_fleet as df
+from lease_fakes import FakeChild, FakeSlotDB
 
 
 # --------------------------------------------------------------------------- #
@@ -250,3 +254,210 @@ def test_route_slots_trims_to_k_after_filtering():
     out = df.route_slots(3, pick_fn=lambda n: rows)
     assert len(out) == 3
     assert out[0]["endpoint_url"] == "http://n0:8081/v1"   # the warm one leads
+
+
+# =========================================================================== #
+# RFC 0001 — exclusive slot leases around each shard (Slice D: BC1, BC4).
+#
+# These drive run_leased_shard / dispatch with injected fakes: FakeSlotDB models
+# the real claim/renew/release SQL semantics with a controllable clock, FakeChild
+# stands in for the `di --json` Popen. No real DB, subprocess, or wall-clock wait.
+# =========================================================================== #
+def _di_json(url):
+    """A minimal valid `di --json` RunResult string for a fake child's stdout."""
+    return json.dumps(_runresult(ideas=[_idea(url, total=1)]))
+
+
+def _leased(db, child_factory, *, holder="consumer-X", **kw):
+    """Build the production shard_fn (run_leased_shard) bound to a shared fake DB and
+    a no-op sleep, exactly as main() binds it to a real conn_factory."""
+    def shard_fn(endpoint, frames, flags):
+        return df.run_leased_shard(
+            endpoint, frames, flags, holder=holder,
+            conn_factory=lambda: db, lease_ops=df.leases, child_factory=child_factory,
+            sleep=lambda _s: None, **kw)
+    return shard_fn
+
+
+# --------------------------------------------------------------------------- #
+# BC1 (the gated guarantee) — responsive in-flight abort, honest falsifier.
+#
+# A lost lease terminates the running `di --json` child IN THE RENEW PATH. The
+# loss is a REAL event (autonomous expiry) and the successor claims via the REAL
+# claim seam — no test-only gpu_busy/sleep handshake the production path lacks. We
+# assert prompt abort on loss; we do NOT assert a happens-before the code cannot
+# enforce (the successor may claim on expiry before the predecessor reaps — the
+# irreducible client-side deadman residual the RFC accepts; see PRIOR_FINDINGS).
+# --------------------------------------------------------------------------- #
+def test_lost_lease_aborts_di_child_in_renew_path():
+    slot = {"node": "proximal", "endpoint_url": "http://proximal:8081/v1", "slot_id": 0}
+    db = FakeSlotDB([slot])
+    child = FakeChild(runs_forever=True)
+    holder_a, holder_b = "consumer-A", "consumer-B"
+    b = {}
+
+    def advancing_sleep(_seconds):
+        # One renew interval passes for A. The lease lapses on the autonomous
+        # wall-clock and a SUCCESSOR claims the slot through the REAL claim seam, so
+        # A's next renew matches zero rows (fenced by lease_id + expiry).
+        db.advance(10)  # ttl below is 5s; now is past A's expiry
+        if "id" not in b:
+            b["id"] = df.claim(db, slot, holder_b, ttl_seconds=45)
+
+    with pytest.raises(df.LeaseLost):
+        df.run_leased_shard(
+            slot, frames=3, flags=[], holder=holder_a,
+            conn_factory=lambda: db, lease_ops=df.leases,
+            child_factory=lambda *a: child,
+            ttl_seconds=5, renew_seconds=5, sleep=advancing_sleep)
+
+    # BC1-A: A terminated its OWN di --json child as a direct consequence of the lost
+    # renew — the kill lives in the same control path that observed the failure.
+    assert child.terminated is True
+    # The successor holds the slot via the real claim seam; A's lease_id is fenced
+    # out, so A's finally-release is a no-op and never clobbers B.
+    assert b["id"] is not None
+    assert db.row_for(slot)["lease_holder"] == holder_b
+
+
+def test_failed_renew_aborts_shard():
+    # Focused BC1-A unit: a renew that returns False (lease lost) terminates the child
+    # right there and the lease is released even on the abort path.
+    child = FakeChild(runs_forever=True)
+
+    class _Ops:
+        def __init__(self):
+            self.released = []
+
+        def claim(self, conn, slot, holder, *, ttl_seconds=45, model_mib=0):
+            return "L1"
+
+        def renew(self, conn, lease_id, *, ttl_seconds=45):
+            return False  # lease lost
+
+        def release(self, conn, lease_id):
+            self.released.append(lease_id)
+
+    ops = _Ops()
+    with pytest.raises(df.LeaseLost):
+        df.run_leased_shard(
+            {"endpoint_url": "http://x:8081/v1"}, 1, [], holder="A",
+            conn_factory=lambda: None, lease_ops=ops,
+            child_factory=lambda *a: child, renew_seconds=1, sleep=lambda _s: None)
+    assert child.terminated is True
+    assert ops.released == ["L1"]
+
+
+def test_run_leased_shard_raises_when_slot_cannot_be_claimed():
+    # No lease -> no GPU work: the child is never even launched.
+    slot = {"node": "n", "endpoint_url": "http://busy:8081/v1", "slot_id": 0}
+    db = FakeSlotDB([slot])
+    df.claim(db, slot, "other", ttl_seconds=45)  # slot already held, unexpired
+    launched = []
+
+    def child_factory(*a):
+        launched.append(1)
+        return FakeChild()
+
+    with pytest.raises(df.LeaseLost):
+        df.run_leased_shard(slot, 1, [], holder="A", conn_factory=lambda: db,
+                            lease_ops=df.leases, child_factory=child_factory,
+                            sleep=lambda _s: None)
+    assert launched == []
+
+
+def test_release_called_on_completion_and_no_renew_after():
+    # Clean completion: a child that finishes before the first renew interval is
+    # collected, the lease is released, and renew is NEVER called for it.
+    child = FakeChild(returncode=0, stdout=_di_json("http://x:8081/v1"))
+
+    class _Ops:
+        def __init__(self):
+            self.released = None
+            self.renews = 0
+
+        def claim(self, conn, slot, holder, *, ttl_seconds=45, model_mib=0):
+            return "L1"
+
+        def renew(self, conn, lease_id, *, ttl_seconds=45):
+            self.renews += 1
+            return True
+
+        def release(self, conn, lease_id):
+            self.released = lease_id
+
+    ops = _Ops()
+
+    def no_sleep(_s):
+        raise AssertionError("a finished child must not sleep/renew")
+
+    result = df.run_leased_shard(
+        {"endpoint_url": "http://x:8081/v1"}, 5, [], holder="A",
+        conn_factory=lambda: None, lease_ops=ops,
+        child_factory=lambda *a: child, sleep=no_sleep)
+    assert result["problem"] == "p"
+    assert ops.renews == 0
+    assert ops.released == "L1"
+
+
+# --------------------------------------------------------------------------- #
+# K-fan-out across N slots holds N DISTINCT leases, all released on completion.
+# --------------------------------------------------------------------------- #
+def test_kfanout_claims_n_distinct_leases():
+    slots = [{"node": "n", "endpoint_url": f"http://n{i}:8081/v1", "slot_id": i,
+              "served_model": "m", "probe_ms": 1.0} for i in range(3)]
+    db = FakeSlotDB(slots)
+
+    def child_factory(slot, frames, flags):
+        return FakeChild(returncode=0, stdout=_di_json(slot["endpoint_url"]))
+
+    results, lost = df.dispatch(slots, total_frames=9, flags=[],
+                                shard_fn=_leased(db, child_factory))
+    assert lost == []
+    assert len(results) == 3
+    assert len(set(db.issued)) == 3  # three DISTINCT leases, one per slot
+    assert all(r["lease_id"] is None for r in db.rows.values())  # all released
+
+
+# --------------------------------------------------------------------------- #
+# BC4 — failover: dead shard's lease freed immediately; survivor re-pinned.
+# (Atomicity of the single-transaction transfer is in test_leases.py /
+#  test_leases_pg.py; here we pin di-fleet's runtime failover behavior.)
+# --------------------------------------------------------------------------- #
+def test_failover_transfer_releases_dead_and_claims_survivor():
+    slots = [{"node": "n", "endpoint_url": f"http://n{i}:8081/v1", "slot_id": i,
+              "served_model": "m", "probe_ms": 1.0} for i in range(3)]
+    dead_url = slots[1]["endpoint_url"]
+    db = FakeSlotDB(slots)
+
+    def child_factory(slot, frames, flags):
+        if slot["endpoint_url"] == dead_url:
+            return FakeChild(returncode=1, stdout="", stderr="slot died mid-run")
+        return FakeChild(returncode=0, stdout=_di_json(slot["endpoint_url"]))
+
+    results, lost = df.dispatch(slots, total_frames=9, flags=[],
+                                shard_fn=_leased(db, child_factory))
+    assert lost == []  # a survivor served the dead shard's frames
+    assert any(r.get("failed_over_from") == dead_url for r in results)
+    dead_slot = next(s for s in slots if s["endpoint_url"] == dead_url)
+    assert db.row_for(dead_slot)["lease_id"] is None  # dead lease freed immediately
+    assert all(r["lease_id"] is None for r in db.rows.values())
+
+
+def test_no_survivor_failover_releases_dead_lease():
+    # BC4 no-survivor branch: the only slot dies, so there is no survivor to fail
+    # over to. Its frames are abandoned, but its lease is freed RIGHT NOW (not held
+    # to the TTL), so the slot is immediately re-claimable.
+    slot = {"node": "n", "endpoint_url": "http://only:8081/v1", "slot_id": 0,
+            "served_model": "m", "probe_ms": 1.0}
+    db = FakeSlotDB([slot])
+
+    def child_factory(s, frames, flags):
+        return FakeChild(returncode=1, stdout="", stderr="slot died mid-run")
+
+    results, lost = df.dispatch([slot], total_frames=3, flags=[],
+                                shard_fn=_leased(db, child_factory))
+    assert results == []
+    assert sum(x["frames"] for x in lost) == 3  # frames abandoned (no survivor)
+    assert db.row_for(slot)["lease_id"] is None  # freed immediately, no TTL wait
+    assert df.claim(db, slot, "next") is not None  # and immediately re-claimable
