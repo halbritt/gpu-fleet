@@ -1,0 +1,152 @@
+{
+  "schema_version": "striatum.workflow.v1.1",
+  "workflow_id": "rfc-__RFC_ID__-build",
+  "workflow_version": "2026-06-22",
+  "name": "RFC __RFC_ID__ — Build & verify",
+  "branch": {
+    "allow_dirty": false,
+    "mode": "confirm",
+    "suggested_name": "striatum/rfc-__RFC_ID__-campaign"
+  },
+  "context_docs": [
+    {"path": "striatum/campaign/rfc-__RFC_ID__/design/COMMITTED_PLAN.md", "required": true},
+    {"path": "__RFC_PATH__", "required": true}
+  ],
+  "coordinator": {
+    "lane_id": "claude",
+    "role_id": "author"
+  },
+  "lanes": {
+    "claude": {
+      "adapter": "process",
+      "display_model": "Claude Opus 4.8",
+      "command": ["claude", "--dangerously-skip-permissions", "--model", "claude-opus-4-8"],
+      "adapter_capabilities": {"agent_loop": true},
+      "supervision": {"transport": "pty_helper", "compatible": true, "require_tmux": true},
+      "worktree_isolation": "per_job",
+      "capabilities": ["write", "review", "synthesis", "interrogate"]
+    },
+    "codex": {
+      "adapter": "process",
+      "display_model": "OpenAI Codex (gpt-5.5)",
+      "command": ["codex", "--yolo"],
+      "adapter_capabilities": {"agent_loop": true},
+      "supervision": {"transport": "pty_helper", "compatible": true, "require_tmux": true},
+      "worktree_isolation": "per_job",
+      "capabilities": ["write", "review", "interrogate"]
+    }
+  },
+  "roles": {
+    "author": {"definition_path": "roles/author.md"},
+    "reviewer": {"definition_path": "roles/reviewer.md"}
+  },
+  "parallelism": {
+    "mode": "declared",
+    "max_active_jobs": 1,
+    "require_disjoint_write_scopes": true
+  },
+  "cycles": [
+    {"from": "review", "to": "draft", "on_verdict": "needs_revision", "max_iterations": 1}
+  ],
+  "edges": [
+    {"from": "draft", "to": "review", "on": "completed"},
+    {"from": "review", "to": "apply", "on": "completed"}
+  ],
+  "jobs": [
+    {
+      "id": "draft",
+      "type": "draft",
+      "title": "Implement the RFC per the committed plan",
+      "role_id": "author",
+      "lane_id": "claude",
+      "objective": "Execute the committed build plan: migration 006, code changes within the plan blast radius, and tests mapped to each falsifiable-gate item; keep `pytest tests/ -q` green and hermetic. Do not touch live infra.",
+      "task_prompt": {"path": "prompts/draft.md"},
+      "write_scope": {
+        "mode": "repo_write",
+        "repo_write": true,
+        "publish_source_changes": true,
+        "allowed_paths": [
+          "migrations/",
+          "bin/",
+          "tests/",
+          "di_fleet.py",
+          "pick_slot.py",
+          "heartbeat.py",
+          "heartbeat_all.py",
+          "conftest.py",
+          "striatum/campaign/rfc-__RFC_ID__/build/"
+        ],
+        "forbidden_paths": [".striatum/", "docs/rfc/", "striatum/workflows/"]
+      },
+      "expected_artifacts": [
+        {
+          "logical_name": "claim_ledger",
+          "kind": "handoff",
+          "path": "striatum/campaign/rfc-__RFC_ID__/build/CLAIM_LEDGER.md",
+          "placement": "git_publication",
+          "required": true
+        }
+      ]
+    },
+    {
+      "id": "review",
+      "type": "review",
+      "title": "Verify against the RFC falsifiable gate",
+      "role_id": "reviewer",
+      "lane_id": "codex",
+      "fresh_session_required": true,
+      "objective": "Independently re-run the tests and verify each falsifiable-gate item against the actual diff; record a finding with a verdict. Do not edit code.",
+      "task_prompt": {"path": "prompts/review.md"},
+      "write_scope": {
+        "mode": "review_only_artifact",
+        "repo_write": false,
+        "allowed_paths": ["striatum/campaign/rfc-__RFC_ID__/build/review/"],
+        "forbidden_paths": [".striatum/", "docs/rfc/"]
+      },
+      "expected_artifacts": [
+        {
+          "logical_name": "verification_review",
+          "kind": "finding",
+          "path": "striatum/campaign/rfc-__RFC_ID__/build/review/VERIFICATION_REVIEW.md",
+          "placement": "blob_exhaust",
+          "required": true
+        }
+      ]
+    },
+    {
+      "id": "apply",
+      "type": "synthesis",
+      "title": "Apply accepted findings and finalize",
+      "role_id": "author",
+      "lane_id": "claude",
+      "objective": "Address accepted review findings, confirm the tree is green, and write the final report with the exact operator deployment steps.",
+      "task_prompt": {"path": "prompts/apply.md"},
+      "write_scope": {
+        "mode": "repo_write",
+        "repo_write": true,
+        "publish_source_changes": true,
+        "allowed_paths": [
+          "migrations/",
+          "bin/",
+          "tests/",
+          "di_fleet.py",
+          "pick_slot.py",
+          "heartbeat.py",
+          "heartbeat_all.py",
+          "conftest.py",
+          "striatum/campaign/rfc-__RFC_ID__/build/"
+        ],
+        "forbidden_paths": [".striatum/", "docs/rfc/", "striatum/workflows/"]
+      },
+      "expected_artifacts": [
+        {
+          "logical_name": "final_report",
+          "kind": "synthesis",
+          "path": "striatum/campaign/rfc-__RFC_ID__/build/FINAL_REPORT.md",
+          "placement": "git_publication",
+          "required": true
+        }
+      ]
+    }
+  ]
+}

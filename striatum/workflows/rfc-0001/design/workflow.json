@@ -1,0 +1,243 @@
+{
+  "schema_version": "striatum.workflow.v1.1",
+  "workflow_id": "rfc-0001-design",
+  "workflow_version": "2026-06-22",
+  "name": "RFC 0001 — Design gate",
+  "allow_same_model_review_pairing": true,
+  "branch": {
+    "allow_dirty": false,
+    "mode": "confirm",
+    "suggested_name": "striatum/rfc-0001-campaign"
+  },
+  "context_docs": [
+    {"path": "docs/rfc/0001-exclusive-slot-leases.md", "required": true}
+  ],
+  "coordinator": {
+    "lane_id": "claude",
+    "role_id": "holder"
+  },
+  "lanes": {
+    "claude": {
+      "adapter": "process",
+      "display_model": "Claude Opus 4.8",
+      "command": ["claude", "--dangerously-skip-permissions", "--model", "claude-opus-4-8"],
+      "adapter_capabilities": {"agent_loop": true},
+      "supervision": {"transport": "pty_helper", "compatible": true, "require_tmux": true},
+      "worktree_isolation": "per_job",
+      "capabilities": ["write", "review", "synthesis", "interrogate"]
+    },
+    "codex": {
+      "adapter": "process",
+      "display_model": "OpenAI Codex (gpt-5.5)",
+      "command": ["codex", "--yolo"],
+      "adapter_capabilities": {"agent_loop": true},
+      "supervision": {"transport": "pty_helper", "compatible": true, "require_tmux": true},
+      "worktree_isolation": "per_job",
+      "capabilities": ["write", "review", "interrogate"]
+    },
+    "agy": {
+      "adapter": "process",
+      "display_model": "Antigravity (gemini)",
+      "command": ["agy", "--dangerously-skip-permissions"],
+      "adapter_capabilities": {"agent_loop": true},
+      "supervision": {"transport": "pty_helper", "compatible": true, "require_tmux": true},
+      "worktree_isolation": "per_job",
+      "capabilities": ["write", "review", "interrogate"]
+    }
+  },
+  "roles": {
+    "holder": {"definition_path": "roles/holder.md"},
+    "falsifier": {"definition_path": "roles/falsifier.md"},
+    "adjudicator": {"definition_path": "roles/adjudicator.md"},
+    "committer": {"definition_path": "roles/committer.md"}
+  },
+  "parallelism": {
+    "mode": "declared",
+    "max_active_jobs": 1,
+    "require_disjoint_write_scopes": true
+  },
+  "phases": [
+    {
+      "id": "dialogue",
+      "name": "Dialogue",
+      "description": "Build plan authored from the RFC, then challenged by falsifiers and adjudicated",
+      "synthesis_job_id": "adjudicate"
+    },
+    {
+      "id": "commit",
+      "name": "Commit",
+      "description": "Gated build plan published only after the ledger clears",
+      "synthesis_job_id": "final_summary"
+    }
+  ],
+  "jobs": [
+    {
+      "id": "holder",
+      "type": "build",
+      "title": "Author build plan from the RFC",
+      "role_id": "holder",
+      "lane_id": "claude",
+      "phase_id": "dialogue",
+      "objective": "Translate the settled RFC in context_docs into a falsifiable build plan (ordered committable slices, migration 006, falsifiable-gate->test map, live-infra safety) as the claim falsifiers will challenge.",
+      "task_prompt": {"path": "prompts/collaboration_holder.md"},
+      "write_scope": {
+        "mode": "repo_write",
+        "repo_write": true,
+        "allowed_paths": ["striatum/campaign/rfc-0001/design/dialogue/holder/"],
+        "forbidden_paths": [".striatum/", "docs/rfc/"]
+      },
+      "expected_artifacts": [
+        {
+          "logical_name": "build_plan",
+          "kind": "work_plan",
+          "path": "striatum/campaign/rfc-0001/design/dialogue/holder/BUILD_PLAN.md",
+          "placement": "git_publication",
+          "required": true
+        }
+      ]
+    },
+    {
+      "id": "falsifier_1",
+      "type": "build",
+      "title": "Falsifier 1 — migration safety, live-infra, test-gate adequacy",
+      "role_id": "falsifier",
+      "lane_id": "codex",
+      "phase_id": "dialogue",
+      "objective": "Attack the build plan from the migration-safety, live-infra-leak, di --json boundary, and test-gate-adequacy posture; publish the strongest falsifying challenge you can justify.",
+      "task_prompt": {"path": "prompts/collaboration_falsifier.md"},
+      "write_scope": {
+        "mode": "repo_write",
+        "repo_write": true,
+        "allowed_paths": ["striatum/campaign/rfc-0001/design/dialogue/falsifier_1/"],
+        "forbidden_paths": [".striatum/", "docs/rfc/"]
+      },
+      "expected_artifacts": [
+        {
+          "logical_name": "falsifier_1",
+          "kind": "handoff",
+          "path": "striatum/campaign/rfc-0001/design/dialogue/falsifier_1/FALSIFIER.md",
+          "placement": "git_publication",
+          "required": true
+        }
+      ]
+    },
+    {
+      "id": "falsifier_2",
+      "type": "build",
+      "title": "Falsifier 2 — slice decomposition, reversibility, correctness",
+      "role_id": "falsifier",
+      "lane_id": "agy",
+      "phase_id": "dialogue",
+      "objective": "Attack the build plan from the slice-decomposition, independent-committability, reversibility, and correctness-of-the-falsifiable-gate posture; publish the strongest falsifying challenge you can justify.",
+      "task_prompt": {"path": "prompts/collaboration_falsifier.md"},
+      "write_scope": {
+        "mode": "repo_write",
+        "repo_write": true,
+        "allowed_paths": ["striatum/campaign/rfc-0001/design/dialogue/falsifier_2/"],
+        "forbidden_paths": [".striatum/", "docs/rfc/"]
+      },
+      "expected_artifacts": [
+        {
+          "logical_name": "falsifier_2",
+          "kind": "handoff",
+          "path": "striatum/campaign/rfc-0001/design/dialogue/falsifier_2/FALSIFIER.md",
+          "placement": "git_publication",
+          "required": true
+        }
+      ]
+    },
+    {
+      "id": "adjudicate",
+      "type": "phase_synthesis",
+      "title": "Adjudicate build-plan challenges",
+      "role_id": "adjudicator",
+      "lane_id": "claude",
+      "phase_id": "dialogue",
+      "fresh_session_required": true,
+      "objective": "Read only the dialogue trajectory and publish the collaboration ledger verdict: does the build plan survive falsification, and which objections become binding constraints for the build?",
+      "task_prompt": {"path": "prompts/adjudicate_collaboration.md"},
+      "write_scope": {
+        "mode": "repo_write",
+        "repo_write": true,
+        "allowed_paths": ["striatum/campaign/rfc-0001/design/dialogue/adjudicator/"],
+        "forbidden_paths": [".striatum/", "docs/rfc/"]
+      },
+      "expected_artifacts": [
+        {
+          "logical_name": "collaboration_ledger_${cycle}",
+          "kind": "collaboration_ledger",
+          "path": "striatum/campaign/rfc-0001/design/dialogue/adjudicator/COLLABORATION_LEDGER_${cycle}.md",
+          "placement": "git_publication",
+          "required": true
+        }
+      ]
+    },
+    {
+      "id": "commit_proposal",
+      "type": "synthesis",
+      "title": "Commit gated build plan",
+      "role_id": "committer",
+      "lane_id": "claude",
+      "phase_id": "commit",
+      "objective": "Publish the committed build plan -- the plan amended with every binding constraint from the adjudicator ledger -- only after the ledger records a clearing verdict.",
+      "task_prompt": {"path": "prompts/collaboration_commit.md"},
+      "write_scope": {
+        "mode": "repo_write",
+        "repo_write": true,
+        "allowed_paths": ["striatum/campaign/rfc-0001/design/COMMITTED_PLAN.md"],
+        "forbidden_paths": [".striatum/", "docs/rfc/"]
+      },
+      "expected_artifacts": [
+        {
+          "logical_name": "committed_plan",
+          "kind": "synthesis",
+          "path": "striatum/campaign/rfc-0001/design/COMMITTED_PLAN.md",
+          "placement": "git_publication",
+          "required": true
+        }
+      ]
+    },
+    {
+      "id": "final_summary",
+      "type": "phase_synthesis",
+      "title": "Summarize design gate",
+      "role_id": "adjudicator",
+      "lane_id": "claude",
+      "phase_id": "commit",
+      "objective": "Summarize the cleared (or refused) design gate: verdict, binding constraints, and a pointer to the committed build plan the build run must execute.",
+      "task_prompt": {"path": "prompts/collaboration_final_summary.md"},
+      "write_scope": {
+        "mode": "repo_write",
+        "repo_write": true,
+        "allowed_paths": ["striatum/campaign/rfc-0001/design/GATE_SUMMARY.md"],
+        "forbidden_paths": [".striatum/", "docs/rfc/"]
+      },
+      "expected_artifacts": [
+        {
+          "logical_name": "gate_summary",
+          "kind": "synthesis",
+          "path": "striatum/campaign/rfc-0001/design/GATE_SUMMARY.md",
+          "placement": "git_publication",
+          "required": true
+        }
+      ]
+    }
+  ],
+  "edges": [
+    {"from": "holder", "to": "falsifier_1", "on": "completed"},
+    {"from": "falsifier_1", "to": "falsifier_2", "on": "completed"},
+    {"from": "falsifier_2", "to": "adjudicate", "on": "completed"},
+    {"from": "adjudicate", "to": "commit_proposal", "on": "completed"},
+    {"from": "commit_proposal", "to": "final_summary", "on": "completed"}
+  ],
+  "cycles": [
+    {
+      "from": "adjudicate",
+      "to": "falsifier_1",
+      "on_verdict": "needs_revision",
+      "max_iterations": 1,
+      "allow_same_model": true,
+      "allow_same_lane": true
+    }
+  ]
+}
