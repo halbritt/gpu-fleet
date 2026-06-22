@@ -9,12 +9,12 @@ is still green and proceed to the report.
 
 List:
 
-- Final files changed and the migration (`migrations/006_*.sql`).
+- Final files changed and the migration (`migrations/0NN_*.sql`, the number used).
 - The falsifiable-gate → test map with the FINAL verbatim pytest result line.
 - Every binding constraint from the committed plan, marked discharged.
 - The EXACT operator deployment steps (the build did NOT perform these):
   1. `python3 -m pytest tests/ -q` is green on the integrated tree.
-  2. Apply migration 006 to the live `gpu_fleet` DB using **stop → migrate →
+  2. Apply the new migration to the live `gpu_fleet` DB using **stop → migrate →
      start** for the `gpu-fleet-heartbeat` service if the change alters
      `probe_model`/sentinels; otherwise migrate-before-restart is sufficient.
   3. Re-deploy `cp bin/di-fleet ~/.local/bin/` if `bin/di-fleet` changed.

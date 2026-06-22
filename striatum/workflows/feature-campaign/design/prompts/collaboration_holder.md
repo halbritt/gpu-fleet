@@ -15,10 +15,12 @@ It MUST contain:
    names the exact files it touches (its blast radius). Source lives at the repo
    root: `di_fleet.py`, `pick_slot.py`, `heartbeat.py`, `heartbeat_all.py`,
    `bin/di-fleet`, `migrations/`, `tests/`.
-2. **Migration plan** — exact schema changes. The next migration number is **006**
-   (001–005 are taken). It MUST be backward-compatible: until consumers use the new
-   columns/state, fleet behavior equals today's. State the apply order (DB →
-   readers → writers).
+2. **Migration plan** — exact schema changes. Use the next **UNUSED** migration
+   number: inspect the `migrations/` directory and take the lowest unused `0NN`
+   (001–005 are taken, and a prior RFC in this campaign may already have landed
+   006/007); never reuse an existing number. It MUST be backward-compatible: until
+   consumers use the new columns/state, fleet behavior equals today's. State the
+   apply order (DB → readers → writers).
 3. **Test plan mapped to the RFC's falsifiable gate** — for EACH bullet in the
    RFC's "Falsifiable gate" section, name the concrete test that proves it and say
    whether it is a hermetic unit test (inject fakes, mirrors

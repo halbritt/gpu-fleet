@@ -6,7 +6,8 @@ the plan's ledger recorded.
 
 ## Do
 
-- Write the migration SQL file `migrations/006_*.sql` exactly per the plan.
+- Write the migration SQL file `migrations/0NN_*.sql` (the next UNUSED number —
+  inspect `migrations/`; never reuse a landed number) exactly per the plan.
 - Implement the code changes (`pick_slot.py`, `di_fleet.py`, `bin/di-fleet`,
   `heartbeat*.py`, etc. — only what the plan's blast radius names).
 - Write/extend tests that map to **EACH** bullet of the RFC's "Falsifiable gate".

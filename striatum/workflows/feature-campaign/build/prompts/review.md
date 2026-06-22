@@ -16,7 +16,8 @@ section, the author's claim ledger, and the **actual diff** on disk.
    - K-fan-out holds N distinct leases; failover releases + reclaims atomically.
    - **No consumer wall-clock** is read anywhere in claim/renew/release (inspection).
    (Use the RFC's own gate list — these are the 0001 examples.)
-3. Confirm the migration is backward-compatible and numbered `006`, the `di --json`
+3. Confirm the migration is backward-compatible and uses the next UNUSED number
+   (not a reused one), the `di --json`
    boundary is intact, and **no live infra** (the `gpu_fleet` DB, the
    `gpu-fleet-heartbeat` service, peecee) is touched by the diff.
 4. Confirm **every binding constraint** from the committed plan's ledger is
