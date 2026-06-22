@@ -100,3 +100,6 @@ systemd timer (Linux) / scheduled task or service (Windows) · NVLink-pair domai
 launched as one tensor-parallel endpoint · richer capacity signal from the nvidia
 exporter (VRAM/util/topology) feeding the same rows · `epoch`-stamped backend-side
 reject for stale routers.
+
+These are designed in [`docs/rfc/`](docs/rfc/) (prepared via `/adhd`; each carries
+a falsifiable gate, to be driven through striatum design→build→verify).
