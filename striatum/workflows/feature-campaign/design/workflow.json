@@ -233,9 +233,9 @@
   "cycles": [
     {
       "from": "adjudicate",
-      "to": "falsifier_1",
+      "to": "holder",
       "on_verdict": "needs_revision",
-      "max_iterations": 1,
+      "max_iterations": 2,
       "allow_same_model": true,
       "allow_same_lane": true
     }

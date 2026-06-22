@@ -39,6 +39,14 @@ It MUST contain:
 6. **Open questions** — answer each open question the RFC leaves with the choice the
    build will adopt, and why.
 
+## If you are REVISING (a prior `needs_revision` verdict)
+
+If a collaboration ledger from a prior cycle is in the dialogue, you are revising.
+Read it, discharge **every binding constraint** it recorded (fold the fix into the
+relevant slice and into the falsifiable-gate→test map), restate any claim the
+adjudicator said you only conceded, and preserve everything the ledger said
+survived falsification. Do not re-open the RFC's settled design.
+
 ## Claims to make falsifiable
 
 State each load-bearing plan claim with the evidence that would support it and the
