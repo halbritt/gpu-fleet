@@ -6,7 +6,7 @@
   "branch": {
     "allow_dirty": false,
     "mode": "confirm",
-    "suggested_name": "striatum/rfc-__RFC_ID__-campaign"
+    "suggested_name": "striatum/rfc-__RFC_ID__-build"
   },
   "context_docs": [
     {"path": "striatum/campaign/rfc-__RFC_ID__/design/COMMITTED_PLAN.md", "required": true},

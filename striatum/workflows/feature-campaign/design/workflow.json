@@ -7,7 +7,7 @@
   "branch": {
     "allow_dirty": false,
     "mode": "confirm",
-    "suggested_name": "striatum/rfc-__RFC_ID__-campaign"
+    "suggested_name": "striatum/rfc-__RFC_ID__-design"
   },
   "context_docs": [
     {"path": "__RFC_PATH__", "required": true}
