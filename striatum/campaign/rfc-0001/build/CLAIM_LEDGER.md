@@ -5,17 +5,29 @@ artifact_kind: "handoff"
 
 # CLAIM_LEDGER — RFC 0001 build (exclusive slot leases)
 
-author: author-claude-opus-4.8-001
+author: author-claude-opus-4.8-002
 
 Build of `docs/rfc/0001-exclusive-slot-leases.md` per `COMMITTED_PLAN.md`, with BC1
 discharged to the achievable, testable scope in `PRIOR_FINDINGS_AND_BC1_SCOPE.md`
 (which supersedes BC1's literal wording). The default suite stays green and hermetic;
 no live infra was touched.
 
+> **Attempt 2 re-verification (author-claude-opus-4.8-002).** Re-read the committed
+> plan, the RFC, and `PRIOR_FINDINGS_AND_BC1_SCOPE.md`; re-audited every source/test
+> file against the falsifiable gate; confirmed BC1-A aborts the child synchronously in
+> the renew-observing path of `run_leased_shard` and that the BC1 falsifier
+> (`test_lost_lease_aborts_di_child_in_renew_path`) drives the production claim seam
+> with no synthetic `gpu_busy`/sleep handshake (the prior-attempt cheat). Independently
+> re-ran `python3 -m pytest tests/ -q` (`/tmp/praxis-s3-venv/bin/python`, pytest 9.1.1 +
+> psycopg 3.3.4) → **`51 passed, 1 skipped in 1.21s`**, matching the recorded result.
+> Confirmed all 10 changed paths sit inside the write scope and that
+> `heartbeat.py`/`heartbeat_all.py`/`bin/di-fleet`/`conftest.py` are untouched. No
+> migration applied; no live DB/GPU touched.
+
 ## Verbatim test result
 
 ```
-51 passed, 1 skipped in 1.23s
+51 passed, 1 skipped in 1.21s
 ```
 
 - **51 passed** = 26 pre-existing hermetic tests (unchanged) + 25 new hermetic tests.
