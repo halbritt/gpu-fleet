@@ -268,15 +268,32 @@ def _di_json(url):
     return json.dumps(_runresult(ideas=[_idea(url, total=1)]))
 
 
-def _leased(db, child_factory, *, holder="consumer-X", **kw):
+def _leased(db, child_factory, *, holder="consumer-X", lease_ops=None, **kw):
     """Build the production shard_fn (run_leased_shard) bound to a shared fake DB and
     a no-op sleep, exactly as main() binds it to a real conn_factory."""
+    ops = lease_ops if lease_ops is not None else df.leases
+
     def shard_fn(endpoint, frames, flags):
         return df.run_leased_shard(
             endpoint, frames, flags, holder=holder,
-            conn_factory=lambda: db, lease_ops=df.leases, child_factory=child_factory,
+            conn_factory=lambda: db, lease_ops=ops, child_factory=child_factory,
             sleep=lambda _s: None, **kw)
     return shard_fn
+
+
+def _leased_failover(db, child_factory, *, holder="consumer-X", lease_ops=None, **kw):
+    """Build the production failover_fn (run_failover_shard) bound to the same fake DB,
+    exactly as main() binds it. Both conn factories return the shared fake; the fake's
+    no-op commit/rollback model the single transfer transaction (true atomicity is
+    proven against real Postgres in test_leases_pg.py)."""
+    ops = lease_ops if lease_ops is not None else df.leases
+
+    def failover_fn(dead_lease_id, survivor, frames, flags):
+        return df.run_failover_shard(
+            dead_lease_id, survivor, frames, flags, holder=holder,
+            conn_factory=lambda: db, transfer_conn_factory=lambda: db,
+            lease_ops=ops, child_factory=child_factory, sleep=lambda _s: None, **kw)
+    return failover_fn
 
 
 # --------------------------------------------------------------------------- #
@@ -422,7 +439,8 @@ def test_kfanout_claims_n_distinct_leases():
 # --------------------------------------------------------------------------- #
 # BC4 — failover: dead shard's lease freed immediately; survivor re-pinned.
 # (Atomicity of the single-transaction transfer is in test_leases.py /
-#  test_leases_pg.py; here we pin di-fleet's runtime failover behavior.)
+#  test_leases_pg.py; here we pin di-fleet's runtime failover behavior AND that the
+#  production dispatch path actually routes failover through that atomic transfer.)
 # --------------------------------------------------------------------------- #
 def test_failover_transfer_releases_dead_and_claims_survivor():
     slots = [{"node": "n", "endpoint_url": f"http://n{i}:8081/v1", "slot_id": i,
@@ -436,7 +454,8 @@ def test_failover_transfer_releases_dead_and_claims_survivor():
         return FakeChild(returncode=0, stdout=_di_json(slot["endpoint_url"]))
 
     results, lost = df.dispatch(slots, total_frames=9, flags=[],
-                                shard_fn=_leased(db, child_factory))
+                                shard_fn=_leased(db, child_factory),
+                                failover_fn=_leased_failover(db, child_factory))
     assert lost == []  # a survivor served the dead shard's frames
     assert any(r.get("failed_over_from") == dead_url for r in results)
     dead_slot = next(s for s in slots if s["endpoint_url"] == dead_url)
@@ -456,8 +475,67 @@ def test_no_survivor_failover_releases_dead_lease():
         return FakeChild(returncode=1, stdout="", stderr="slot died mid-run")
 
     results, lost = df.dispatch([slot], total_frames=3, flags=[],
-                                shard_fn=_leased(db, child_factory))
+                                shard_fn=_leased(db, child_factory),
+                                failover_fn=_leased_failover(db, child_factory))
     assert results == []
     assert sum(x["frames"] for x in lost) == 3  # frames abandoned (no survivor)
     assert db.row_for(slot)["lease_id"] is None  # freed immediately, no TTL wait
     assert df.claim(db, slot, "next") is not None  # and immediately re-claimable
+
+
+def test_dispatch_failover_routes_through_atomic_transfer_not_release_then_claim():
+    # PRODUCTION-PATH GUARD for the prior reviewer's blocking finding: runtime failover
+    # MUST go through the single-transaction release+claim (failover_transfer), and the
+    # dead lease MUST NOT be released by the first-attempt path before the replacement
+    # claim is secured. We spy the lease ops the production code calls. Because
+    # failover_transfer disposes the dead lease via the MODULE-LEVEL release (not via
+    # lease_ops), any ("release", dead_lease_id) the spy records is necessarily a
+    # standalone first-attempt release — exactly the release-now, claim-later bug. The
+    # new code leaves the dead lease HELD (ShardDied) for the transfer, so that event
+    # must be absent and a ("transfer", dead_lease_id) event present.
+    slots = [{"node": "n", "endpoint_url": f"http://n{i}:8081/v1", "slot_id": i,
+              "served_model": "m", "probe_ms": 1.0} for i in range(2)]
+    dead_url = slots[0]["endpoint_url"]
+    db = FakeSlotDB(slots)
+    events = []
+
+    class SpyOps:
+        # Wraps the real lease module; records standalone (non-transfer) calls.
+        claim = staticmethod(df.claim)
+        renew = staticmethod(df.renew)
+
+        @staticmethod
+        def release(conn, lease_id):
+            events.append(("release", lease_id))
+            return df.release(conn, lease_id)
+
+        @staticmethod
+        def failover_transfer(conn, dead_lease_id, candidates, holder, **kw):
+            events.append(("transfer", dead_lease_id))
+            return df.failover_transfer(conn, dead_lease_id, candidates, holder, **kw)
+
+    ops = SpyOps()
+
+    def child_factory(slot, frames, flags):
+        if slot["endpoint_url"] == dead_url:
+            return FakeChild(returncode=1, stdout="", stderr="slot died mid-run")
+        return FakeChild(returncode=0, stdout=_di_json(slot["endpoint_url"]))
+
+    results, lost = df.dispatch(
+        slots, total_frames=8, flags=[],
+        shard_fn=_leased(db, child_factory, lease_ops=ops),
+        failover_fn=_leased_failover(db, child_factory, lease_ops=ops))
+
+    assert lost == []  # the survivor served the dead shard's frames
+    transfers = [e for e in events if e[0] == "transfer"]
+    assert len(transfers) == 1, f"failover must route through failover_transfer: {events}"
+    dead_lease_id = transfers[0][1]
+    assert dead_lease_id is not None, "the dead shard's held lease must reach the transfer"
+    # The dead lease was disposed ONLY by the atomic transfer — never by a standalone
+    # first-attempt release before the survivor claim (the release-now, claim-later bug).
+    assert ("release", dead_lease_id) not in events, (
+        f"dead lease {dead_lease_id} released outside the atomic transfer: {events}")
+    assert any(r.get("failed_over_from") == dead_url for r in results)
+    dead_slot = next(s for s in slots if s["endpoint_url"] == dead_url)
+    assert db.row_for(dead_slot)["lease_id"] is None  # freed via the transfer
+    assert all(r["lease_id"] is None for r in db.rows.values())

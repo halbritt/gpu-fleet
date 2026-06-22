@@ -22,7 +22,12 @@ Three load-bearing guarantees, mirrored from the registry's own discipline:
     zero rows (lease lost: expiry, zombie re-claim, or epoch change) it terminates
     that child SYNCHRONOUSLY, in the same control path that observed the loss
     (BC1-A) — it does not wait for a later independent poll. See run_leased_shard
-    for the abort mechanism and its documented irreducible residual.
+    for the abort mechanism and its documented irreducible residual. When a shard
+    dies while still holding its lease, failover is an ATOMIC transfer (BC4): the
+    dead lease is released AND a survivor claimed in ONE Postgres transaction
+    (run_failover_shard -> failover_transfer), so the freed capacity never hits the
+    open pool between the two ops and the dead lease is never released before the
+    replacement claim is secured.
 
 The boundary to `di` is a subprocess (RFC 0078/0087): we NEVER import the Node
 engine — the lease monitor aborts by acting on the `Popen` HANDLE
@@ -265,7 +270,24 @@ def shard_frames(total, n):
 class LeaseLost(RuntimeError):
     """The slot lease was lost (could not be claimed, expired, or was re-claimed by
     a successor). The owning shard's `di --json` child has been aborted; `dispatch`
-    treats this like any other dead shard and fails its frames over to a survivor."""
+    treats this like any other dead shard and fails its frames over to a survivor.
+    There is NO lease left to hand off (it was never held, or a successor holds it
+    now), so the dead-lease release is a fenced no-op done inline."""
+
+
+class ShardDied(RuntimeError):
+    """The `di --json` child died mid-run (non-zero exit, unparseable JSON, or
+    timeout) while THIS consumer still holds the slot lease. Unlike LeaseLost the
+    lease is still ours, so run_leased_shard does NOT release it inline — it surfaces
+    the held lease (`.lease_id`) so `dispatch` disposes of it through the RFC 0001
+    failover TRANSFER: release this dead lease AND claim a survivor in ONE Postgres
+    transaction (BC4), so the freed capacity never hits the open pool between the two
+    operations and the dead lease is never released before the replacement claim is
+    secured."""
+
+    def __init__(self, message, *, lease_id):
+        super().__init__(message)
+        self.lease_id = lease_id
 
 
 class _DiChild:
@@ -347,16 +369,14 @@ def _terminate(child, *, grace=5):
         child.kill()
 
 
-def run_leased_shard(slot, frames, flags, *, holder, conn_factory,
-                     lease_ops=leases, child_factory=_popen_child, model_mib=0,
-                     ttl_seconds=TTL_SECONDS, renew_seconds=RENEW_SECONDS,
-                     timeout=SHARD_TIMEOUT, sleep=time.sleep, clock=time.monotonic):
-    """Claim `slot`'s lease, run ONE `di --json` child against it under a per-shard
-    renew monitor that OWNS the child handle, and release the lease on completion
-    (clean OR error). Returns the parsed RunResult; raises LeaseLost if the slot
-    could not be claimed or the lease was lost mid-run, RuntimeError if the child
-    itself failed. The lease ops, child launcher, sleep, and clock are injectable so
-    the whole lifecycle is hermetically testable with no real DB or subprocess.
+def _monitor(conn, slot, child, lease_id, *, lease_ops, ttl_seconds, renew_seconds,
+             timeout, sleep, clock):
+    """Run the per-shard renew monitor over an ALREADY-CLAIMED `lease_id` and the
+    `child` it owns. Returns the parsed RunResult on clean completion; raises
+    LeaseLost if a renew returns zero rows (lease lost mid-run), or ShardDied if the
+    child itself died (non-zero exit, unparseable JSON, or timeout) while we still
+    hold the lease. Reads NO Python clock for any lease predicate (the loop's sleep
+    cadence is a poll interval, not a fence).
 
     BC1-A (responsive abort, the gated guarantee): the renew check and the child
     KILL live in the SAME control path. When a renew returns zero rows — the lease
@@ -375,36 +395,139 @@ def run_leased_shard(slot, frames, flags, *, holder, conn_factory,
     termination); that is OUT OF SCOPE for v1. This code does NOT claim to terminate
     the child before any second consumer can claim — only to abort promptly once the
     loss is observed."""
+    start = clock()
+    while child.poll() is None:
+        if clock() - start >= timeout:
+            child.kill()
+            raise ShardDied(
+                f"di shard timed out after {timeout}s on {slot.get('endpoint_url')}",
+                lease_id=lease_id)
+        sleep(renew_seconds)
+        if child.poll() is not None:
+            break  # child finished during the renew interval
+        if not lease_ops.renew(conn, lease_id, ttl_seconds=ttl_seconds):
+            # BC1-A: lease lost — abort the child HERE, synchronously, in the same
+            # path that observed the failed renew. No later poll, no flag.
+            _terminate(child)
+            raise LeaseLost(
+                f"lease {lease_id} lost mid-shard on {slot.get('endpoint_url')}; "
+                "di --json child terminated")
+    try:
+        return _collect_child_result(child, slot)
+    except RuntimeError as exc:
+        # The child died but the lease is still OURS — surface it held so the caller
+        # (dispatch's failover) can release+claim a survivor in one transaction.
+        raise ShardDied(str(exc), lease_id=lease_id) from exc
+
+
+def _run_and_settle(conn, slot, lease_id, frames, flags, *, holder, lease_ops,
+                    child_factory, release_on_death, ttl_seconds, renew_seconds,
+                    timeout, sleep, clock):
+    """Launch the child for an already-held `lease_id`, drive the renew monitor, and
+    settle the lease according to the outcome:
+
+      * clean completion -> release (fenced) and return the RunResult;
+      * lost renew (LeaseLost) -> release (fenced no-op — a successor holds it now)
+        and re-raise, so OUR slot frees immediately rather than at the TTL;
+      * child died (ShardDied) -> if `release_on_death` (a failover RETRY that has no
+        further fallback) release the transferred slot now; otherwise LEAVE the lease
+        held and re-raise, so dispatch can dispose it via the atomic failover transfer
+        (the dead lease must NOT be released before the replacement claim is secured).
+    """
+    child = child_factory(slot, frames, flags)
+    try:
+        result = _monitor(conn, slot, child, lease_id, lease_ops=lease_ops,
+                          ttl_seconds=ttl_seconds, renew_seconds=renew_seconds,
+                          timeout=timeout, sleep=sleep, clock=clock)
+    except ShardDied:
+        if release_on_death:
+            lease_ops.release(conn, lease_id)
+        raise
+    except BaseException:
+        lease_ops.release(conn, lease_id)
+        raise
+    else:
+        lease_ops.release(conn, lease_id)
+        return result
+
+
+def run_leased_shard(slot, frames, flags, *, holder, conn_factory,
+                     lease_ops=leases, child_factory=_popen_child, model_mib=0,
+                     ttl_seconds=TTL_SECONDS, renew_seconds=RENEW_SECONDS,
+                     timeout=SHARD_TIMEOUT, sleep=time.sleep, clock=time.monotonic):
+    """First-attempt shard: claim `slot`'s lease, run ONE `di --json` child against it
+    under a per-shard renew monitor that OWNS the child handle, and settle the lease.
+    Returns the parsed RunResult; raises LeaseLost if the slot could not be claimed or
+    the lease was lost mid-run (BC1-A abort), or ShardDied if the child itself died
+    while we still hold the lease. The lease ops, child launcher, sleep, and clock are
+    injectable so the whole lifecycle is hermetically testable with no real DB or
+    subprocess.
+
+    On a clean run or a lost renew the lease is released here. On ShardDied the lease
+    is LEFT HELD and surfaced via the exception, so `dispatch` can fail it over with an
+    ATOMIC release-plus-claim transfer (RFC 0001 failover / BC4) rather than a
+    release-now, claim-later sequence that would expose the freed slot to the open
+    pool."""
     conn = conn_factory()
     lease_id = lease_ops.claim(conn, slot, holder,
                                ttl_seconds=ttl_seconds, model_mib=model_mib)
     if lease_id is None:
         _close(conn)
         raise LeaseLost(f"could not claim a lease on {slot.get('endpoint_url')}")
-    child = child_factory(slot, frames, flags)
     try:
-        start = clock()
-        while child.poll() is None:
-            if clock() - start >= timeout:
-                child.kill()
-                raise RuntimeError(
-                    f"di shard timed out after {timeout}s on {slot.get('endpoint_url')}")
-            sleep(renew_seconds)
-            if child.poll() is not None:
-                break  # child finished during the renew interval
-            if not lease_ops.renew(conn, lease_id, ttl_seconds=ttl_seconds):
-                # BC1-A: lease lost — abort the child HERE, synchronously, in the
-                # same path that observed the failed renew. No later poll, no flag.
-                _terminate(child)
-                raise LeaseLost(
-                    f"lease {lease_id} lost mid-shard on {slot.get('endpoint_url')}; "
-                    "di --json child terminated")
-        return _collect_child_result(child, slot)
+        return _run_and_settle(
+            conn, slot, lease_id, frames, flags, holder=holder, lease_ops=lease_ops,
+            child_factory=child_factory, release_on_death=False,
+            ttl_seconds=ttl_seconds, renew_seconds=renew_seconds, timeout=timeout,
+            sleep=sleep, clock=clock)
     finally:
-        # Release is fenced on lease_id: if a successor already re-claimed (we lost
-        # the lease), this matches zero rows and never clobbers them. On any failure
-        # this frees OUR slot immediately rather than waiting for the TTL.
-        lease_ops.release(conn, lease_id)
+        _close(conn)
+
+
+def run_failover_shard(dead_lease_id, survivor_slot, frames, flags, *, holder,
+                       conn_factory, transfer_conn_factory, lease_ops=leases,
+                       child_factory=_popen_child, model_mib=0,
+                       ttl_seconds=TTL_SECONDS, renew_seconds=RENEW_SECONDS,
+                       timeout=SHARD_TIMEOUT, sleep=time.sleep, clock=time.monotonic):
+    """RFC 0001 failover = ATOMIC transfer, not return-to-pool (BC4). In ONE Postgres
+    transaction (a non-autocommit `transfer_conn_factory` conn, committed once) RELEASE
+    the dead shard's still-held lease AND CLAIM a survivor slot via
+    `lease_ops.failover_transfer`, so the freed capacity never hits the open pool
+    between the two ops and the dead lease is never released before the replacement
+    claim is secured. Then run the retry `di --json` child on the survivor under the
+    transferred lease, with the same renew monitor + release as a first-attempt shard
+    (here `release_on_death=True`: a retry has no further fallback, so its own death
+    frees the transferred slot immediately). Raises LeaseLost if no survivor was
+    claimable — the dead lease is still freed in that same committed transaction.
+
+    `dead_lease_id` may be None (the first attempt lost its lease with nothing held);
+    failover_transfer's release is then a no-op and it simply claims a survivor."""
+    tconn = transfer_conn_factory()
+    try:
+        candidates = [survivor_slot] if survivor_slot else []
+        transferred = lease_ops.failover_transfer(
+            tconn, dead_lease_id, candidates, holder,
+            ttl_seconds=ttl_seconds, model_mib=model_mib)
+        _commit(tconn)
+    except BaseException:
+        _rollback(tconn)
+        _close(tconn)
+        raise
+    _close(tconn)
+    if transferred is None:
+        # The dead lease was released in the (committed) transfer; there was no
+        # claimable survivor, so these frames cannot be re-run — dispatch records them
+        # lost. The slot is freed immediately, not held to the TTL.
+        raise LeaseLost(
+            f"failover: no claimable survivor; dead lease {dead_lease_id} released")
+    conn = conn_factory()
+    try:
+        return _run_and_settle(
+            conn, transferred["slot"], transferred["lease_id"], frames, flags,
+            holder=holder, lease_ops=lease_ops, child_factory=child_factory,
+            release_on_death=True, ttl_seconds=ttl_seconds, renew_seconds=renew_seconds,
+            timeout=timeout, sleep=sleep, clock=clock)
+    finally:
         _close(conn)
 
 
@@ -414,10 +537,23 @@ def _close(conn):
         close()
 
 
+def _commit(conn):
+    commit = getattr(conn, "commit", None)
+    if callable(commit):
+        commit()
+
+
+def _rollback(conn):
+    rollback = getattr(conn, "rollback", None)
+    if callable(rollback):
+        rollback()
+
+
 # --------------------------------------------------------------------------- #
 # Dispatch: run all shards concurrently, fail a dead shard over to a survivor.
 # --------------------------------------------------------------------------- #
-def dispatch(slots, total_frames, flags, *, shard_fn, max_workers=None):
+def dispatch(slots, total_frames, flags, *, shard_fn, failover_fn=None,
+             max_workers=None):
     """Shard `total_frames` across `slots`, run one shard per slot concurrently,
     and fail any dead shard over once to a surviving endpoint.
 
@@ -429,7 +565,15 @@ def dispatch(slots, total_frames, flags, *, shard_fn, max_workers=None):
 
     shard_fn(endpoint, frames, flags) is the injectable di boundary. In production
     it is `run_leased_shard` bound to a holder + conn_factory (see main), so every
-    shard runs under an exclusive slot lease; tests inject a plain fake."""
+    shard runs under an exclusive slot lease; tests inject a plain fake.
+
+    failover_fn(dead_lease_id, survivor_endpoint, frames, flags) is the RFC 0001
+    ATOMIC failover transfer (BC4): in ONE transaction it releases the dead shard's
+    still-held lease AND claims the survivor, then runs the retry child there. When it
+    is supplied (the production leased path), the dead lease is disposed ONLY through
+    this single-transaction transfer — never released by the first-attempt path before
+    the replacement claim is secured. When it is None (a plain injected shard_fn with
+    no lease context) failover degrades to re-running shard_fn on a survivor."""
     if not slots:
         return [], []
     counts = shard_frames(total_frames, len(slots))
@@ -451,14 +595,41 @@ def dispatch(slots, total_frames, flags, *, shard_fn, max_workers=None):
             try:
                 results.append({**s, "result": fut.result()})
             except Exception as exc:  # slot died mid-run; queue its frames for failover
-                failed.append({**s, "error": str(exc)})
+                # A leased shard that died while still holding its lease (ShardDied)
+                # carries that lease so failover can transfer it atomically; a plain
+                # fake (or a lost-lease LeaseLost) carries nothing.
+                failed.append({**s, "error": str(exc),
+                               "dead_lease_id": getattr(exc, "lease_id", None)})
 
     # Failover: an endpoint that already returned a result is alive; reassign each
     # dead shard's frames to one such survivor and retry ONCE. Round-robin the
     # survivors so a burst of failures doesn't all pile onto a single slot.
     survivors = [r["endpoint"] for r in results]
     lost = []
-    if failed and survivors:
+    if failed and failover_fn is not None:
+        # Production leased path: dispose every dead lease through the atomic transfer.
+        # No survivor -> failover_fn still releases the dead lease (in that same commit)
+        # and raises, so the slot frees immediately rather than waiting for the TTL.
+        with ThreadPoolExecutor(max_workers=len(failed)) as ex:
+            retry_futs = {}
+            for j, s in enumerate(failed):
+                target = survivors[j % len(survivors)] if survivors else None
+                retry_futs[ex.submit(failover_fn, s.get("dead_lease_id"), target,
+                                     s["frames"], flags)] = (s, target)
+            for fut in as_completed(retry_futs):
+                s, target = retry_futs[fut]
+                try:
+                    results.append(
+                        {"shard": s["shard"], "endpoint": target or s["endpoint"],
+                         "frames": s["frames"], "result": fut.result(),
+                         "failed_over_from": s["endpoint"].get("endpoint_url")}
+                    )
+                except Exception as exc:
+                    lost.append({"endpoint": target or s["endpoint"],
+                                 "frames": s["frames"],
+                                 "error": f"failover transfer failed: {exc}"})
+    elif failed and survivors:
+        # Plain (non-leased) path: reassign the dead shard's frames and retry once.
         with ThreadPoolExecutor(max_workers=len(failed)) as ex:
             retry_futs = {}
             for j, s in enumerate(failed):
@@ -476,7 +647,7 @@ def dispatch(slots, total_frames, flags, *, shard_fn, max_workers=None):
                     lost.append({"endpoint": target, "frames": s["frames"],
                                  "error": f"failover retry also failed: {exc}"})
     else:
-        # No survivor to fail over to (total fleet wipe) -> these frames are lost.
+        # No survivor and no leased failover (total fleet wipe) -> frames are lost.
         lost = [{"endpoint": s["endpoint"], "frames": s["frames"], "error": s["error"]}
                 for s in failed]
 
@@ -676,6 +847,17 @@ def _pg_conn_factory(db):
     return factory
 
 
+def _pg_transfer_conn_factory(db):
+    """A fresh NON-autocommit psycopg connection for one atomic failover transfer.
+    The transfer's release(dead) + claim(survivor) must commit or roll back TOGETHER
+    (RFC 0001 / BC4), so unlike the per-shard autocommit conns this one wraps both
+    statements in a single explicit transaction that run_failover_shard commits once."""
+    def factory():
+        import psycopg
+        return psycopg.connect(db)  # autocommit defaults off -> one explicit txn
+    return factory
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     frames, top, want_json, k_override, passthrough = _split_argv(argv)
@@ -705,12 +887,21 @@ def main(argv=None):
     print(f"di-fleet -> {len(slots)} slot(s): {eps}", file=sys.stderr)
     holder = _holder_id()
     conn_factory = _pg_conn_factory(db)
+    transfer_conn_factory = _pg_transfer_conn_factory(db)
 
     def leased_shard(endpoint, frames, flags):
         return run_leased_shard(endpoint, frames, flags,
                                 holder=holder, conn_factory=conn_factory)
 
-    results, lost = dispatch(slots, total_frames, passthrough, shard_fn=leased_shard)
+    def leased_failover(dead_lease_id, survivor, frames, flags):
+        # RFC 0001 failover transfer: release the dead lease + claim the survivor in
+        # ONE transaction (BC4), then run the retry child under the transferred lease.
+        return run_failover_shard(dead_lease_id, survivor, frames, flags,
+                                  holder=holder, conn_factory=conn_factory,
+                                  transfer_conn_factory=transfer_conn_factory)
+
+    results, lost = dispatch(slots, total_frames, passthrough,
+                             shard_fn=leased_shard, failover_fn=leased_failover)
     if not results:
         print("di-fleet: every shard failed; no result", file=sys.stderr)
         return 1

@@ -63,6 +63,15 @@ class FakeSlotDB:
         # run_leased_shard's finally calls conn.close(); the shared fake survives it.
         pass
 
+    def commit(self):
+        # The transfer conn commits once; this in-memory model applies writes eagerly,
+        # so commit is a no-op. True commit/rollback atomicity is proven against a real
+        # Postgres in test_leases_pg.py::test_failover_transfer_is_atomic.
+        pass
+
+    def rollback(self):
+        pass
+
     def row_for(self, slot):
         return self.rows[(slot["node"], slot["endpoint_url"], slot.get("slot_id", 0))]
 
