@@ -19,15 +19,22 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import psycopg
 
-from heartbeat import UPSERT, decode_probe, discover_served_model, gpu_stats
+from heartbeat import (
+    UPSERT,
+    decode_probe,
+    discover_served_model,
+    gpu_stats,
+    ollama_ondemand_liveness,
+)
 
 FETCH = """
 SELECT node, slot_id, endpoint_url, served_model, probe_model, latency_class,
-       gpu_cmd, nvlink_domain, max_context, free_slots, epoch
+       gpu_cmd, nvlink_domain, max_context, free_slots, epoch, min_load_vram_mib
 FROM fleet_nodes WHERE enabled ORDER BY node, slot_id
 """
 COLS = ["node", "slot_id", "endpoint_url", "served_model", "probe_model",
-        "latency_class", "gpu_cmd", "nvlink_domain", "max_context", "free_slots", "epoch"]
+        "latency_class", "gpu_cmd", "nvlink_domain", "max_context", "free_slots",
+        "epoch", "min_load_vram_mib"]
 
 # Fast-fail probe budgets. A liveness probe must resolve quickly: with nodes
 # probed concurrently, the tick is as slow as the slowest probe, so each leg is
@@ -44,7 +51,16 @@ def probe_node(n: dict) -> dict:
     the caller owns the single DB connection and does the write."""
     stats = gpu_stats(n["gpu_cmd"], GPU_TIMEOUT) or {}
     gpu_err = stats.pop("_error", None)
-    if (n["probe_model"] or n["served_model"]) in ("-", "none", "gpu-only"):
+    if (n["probe_model"] or n["served_model"]) == "ollama-ondemand":
+        # Load-aware liveness for the on-demand ollama MoE that shares its card
+        # with marker. Evaluated BEFORE the decode path so the heartbeat never
+        # forces a load (it decode-probes ONLY when the model is already resident).
+        # served_model is the real tag consumers request.
+        served = n["served_model"]
+        alive, probe_ms, probe_err = ollama_ondemand_liveness(
+            n["endpoint_url"], served, stats, gpu_err,
+            n.get("min_load_vram_mib"), PROBE_TIMEOUT)
+    elif (n["probe_model"] or n["served_model"]) in ("-", "none", "gpu-only"):
         # Non-LLM capability (e.g. marker): liveness is GPU reachability, not an
         # LLM decode-probe. A decode-probe here would needlessly load a model and,
         # for a node mid document-conversion, fight that job for VRAM.
@@ -140,9 +156,24 @@ def main() -> int:
     with psycopg.connect(a.db, autocommit=False) as conn:
         while True:
             t0 = time.monotonic()
-            res = tick(conn)
-            live = sum(1 for r in res if r.get("alive"))
-            print(json.dumps({"ts": int(time.time()), "live": live, "nodes": res}), flush=True)
+            try:
+                res = tick(conn)
+            except Exception as exc:
+                # A tick-level failure (a transient DB error, or FETCH meeting a
+                # schema mid-migration) must NOT crash this always-on driver: under
+                # systemd Restart=always a crash-loop commits no UPSERT, so EVERY
+                # slot goes stale and the whole fleet ages out of live_slots in 45s.
+                # Roll back any aborted txn, log, and retry on the next tick instead.
+                # (A genuinely dead connection makes rollback raise -> we crash ->
+                # systemd restarts and re-establishes the connection, which is right.)
+                conn.rollback()
+                print(json.dumps({"ts": int(time.time()), "error": f"tick failed: {exc}"}),
+                      flush=True)
+                res = []
+            else:
+                live = sum(1 for r in res if r.get("alive"))
+                print(json.dumps({"ts": int(time.time()), "live": live, "nodes": res}),
+                      flush=True)
             if not a.interval:
                 return 0
             # Sleep the remainder of the interval, not a full interval on top of a

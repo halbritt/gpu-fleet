@@ -84,6 +84,92 @@ def decode_probe(endpoint: str, model: str, timeout: float) -> tuple[bool, int |
     return bool(d.get("choices")), ms, None
 
 
+def ollama_resident(endpoint: str, model: str, timeout: float) -> bool:
+    """Is `model` currently loaded in ollama's VRAM? (GET <base sans /v1>/api/ps).
+
+    ollama's /api/ps returns {"models":[{"name": ...}, ...]} for what is resident
+    right now ({"models":[]} when nothing is). This is a pure read — it does NOT
+    load anything — so it is safe to call on the shared card every tick. Used by
+    the 'ollama-ondemand' liveness mode to tell WARM (resident) from COLD (a load
+    would be needed) without forcing that load. On any error, treat as not
+    resident (the caller then falls back to the VRAM-headroom check)."""
+    base = endpoint.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    url = base.rstrip("/") + "/api/ps"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            models = json.load(r).get("models") or []
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, TimeoutError):
+        return False
+    return any(m.get("name") == model for m in models)
+
+
+# Default free-VRAM (MiB) required to call an on-demand ollama model "loadable"
+# when fleet_nodes.min_load_vram_mib is NULL. This is the free VRAM needed to LOAD
+# the model (the peecee MoE's weights are ~21.85 GiB and it loads, with a small CPU
+# spill, whenever the card is otherwise idle — measured idle free 21690-22095 MiB),
+# NOT its total resident footprint. A per-node column is the right knob for a
+# model-specific footprint; a card-fraction heuristic (e.g. 95% of vram_total)
+# misfires on a card with irreducible desktop/driver overhead (peecee never has
+# 23 GiB free), so the fallback is a flat default, not a fraction of the card.
+DEFAULT_MIN_LOAD_VRAM_MIB = 21000
+
+
+def ollama_ondemand_liveness(
+    endpoint: str,
+    model: str,
+    stats: dict,
+    gpu_err: str | None,
+    min_load_vram_mib: int | None,
+    timeout: float,
+    *,
+    resident_fn=None,
+    decode_fn=None,
+) -> tuple[bool, int | None, str | None]:
+    """Load-aware liveness for an on-demand ollama model that time-shares its GPU
+    (the peecee MoE vs. marker). Returns (alive, probe_ms, note).
+
+    Three honest states, mapped onto the existing schema with no consumer change:
+      - WARM  (model already resident): decode-probe to confirm warmth (this does
+               NOT force a load — it is already loaded) -> alive, probe_ms set.
+      - COLD/LOADABLE (not resident, but free VRAM >= threshold): the card is free
+               enough to load on demand -> alive, probe_ms=None. We do NOT decode-
+               probe (that would force the load the heartbeat must never trigger).
+      - NOT LOADABLE (not resident, free VRAM < threshold): marker owns the card,
+               so a real request could not load the model -> alive=False, so it
+               ages out of live_slots and di never routes a request it can't serve.
+
+    GPU unreachable -> alive=False (as for every other slot). `min_load_vram_mib`
+    falls back to a flat DEFAULT_MIN_LOAD_VRAM_MIB when NULL (the threshold is a
+    model-specific load footprint, so the per-node column is the right knob; a
+    fraction-of-card default misfires when the card has desktop/driver overhead).
+
+    `resident_fn`/`decode_fn` default to the module-level `ollama_resident` /
+    `decode_probe`, resolved at call time so a test can monkeypatch them on the
+    module (and so probe_node's plain call honours such a patch)."""
+    resident_fn = resident_fn or ollama_resident
+    decode_fn = decode_fn or decode_probe
+    if gpu_err is not None or stats.get("gpu_model") is None:
+        return False, None, None  # gpu_err is surfaced by the caller's note join
+
+    threshold = min_load_vram_mib
+    if threshold is None:
+        threshold = DEFAULT_MIN_LOAD_VRAM_MIB
+
+    if resident_fn(endpoint, model, timeout):
+        alive, probe_ms, probe_err = decode_fn(endpoint, model, timeout)
+        note = "resident" if alive else (probe_err or "resident but probe failed")
+        return alive, probe_ms, note
+
+    free = stats.get("vram_free_mib")
+    if free is not None and free >= threshold:
+        return True, None, f"loadable: free={free}MiB"
+    return False, None, (
+        f"not loadable: marker owns card (free={free}MiB < {threshold})"
+    )
+
+
 def discover_served_model(endpoint: str, fallback: str | None, timeout: float = 6.0) -> str | None:
     """Self-correct the served model from the endpoint.
 
@@ -104,7 +190,17 @@ def discover_served_model(endpoint: str, fallback: str | None, timeout: float = 
 def heartbeat_once(conn: psycopg.Connection, args) -> dict:
     stats = gpu_stats(args.gpu_cmd) or {}
     gpu_err = stats.pop("_error", None)
-    if (args.probe_model or args.served_model) in ("-", "none", "gpu-only"):
+    probe_err = None
+    if (args.probe_model or args.served_model) == "ollama-ondemand":
+        # Load-aware liveness for the on-demand ollama MoE that shares its card
+        # with marker. Evaluated BEFORE the decode path so we never force a load
+        # of a model that isn't already resident. served_model is the real tag.
+        served = args.served_model
+        alive, probe_ms, note0 = ollama_ondemand_liveness(
+            args.endpoint, served, stats, gpu_err,
+            getattr(args, "min_load_vram_mib", None), args.timeout)
+        probe_err = note0
+    elif (args.probe_model or args.served_model) in ("-", "none", "gpu-only"):
         # Non-LLM capability (e.g. marker): liveness is GPU reachability, not a
         # decode-probe (which would needlessly load a model / fight a running job).
         served = args.served_model
@@ -142,6 +238,9 @@ def main() -> int:
     p.add_argument("--max-context", type=int, default=None)
     p.add_argument("--free-slots", type=int, default=1)
     p.add_argument("--slot-id", type=int, default=0)
+    p.add_argument("--min-load-vram-mib", type=int, default=None,
+                   help="for probe_model=ollama-ondemand: free VRAM needed to call "
+                        "the model loadable (default: 23000 or 95%% of total)")
     p.add_argument("--epoch", type=int, default=0)
     p.add_argument("--timeout", type=float, default=30.0)
     p.add_argument("--db", default="dbname=gpu_fleet")

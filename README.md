@@ -84,12 +84,19 @@ this insert — the human is out of the loop.
 `SKIP LOCKED`, 45 s TTL membership, interactive/batch classes, **concurrent
 fast-fail probing** (nodes probed in parallel and each row committed the moment
 its probe lands, so one slow/black-hole node can't stall the tick and age the
-healthy nodes out of `live_slots`).
+healthy nodes out of `live_slots`), **`di` K-fan-out** (`di-fleet` shards di's
+`--frames` across every live MoE slot, runs one `di` subprocess per endpoint
+concurrently, fails a dead shard over to a surviving slot so no branch is lost,
+and merges the per-shard RunResults into one `di --json`-compatible result), and
+**load-aware liveness for shared on-demand nodes** (`probe_model='ollama-ondemand'`:
+WARM when the model is already resident, COLD/LOADABLE when the card has the
+headroom to load it on demand, NOT-LOADABLE — aged out of `live_slots` — when
+marker owns the GPU; so di never routes to a peecee that can't actually serve and
+the heartbeat never force-loads a model onto a shared card).
 
 **Next:** real slot leases (decrement/restore `free_slots` per claim, deadman
-expiry) so K-fan-out is exclusive, not advisory · `di` wired to `pick` instead of
-a static `DIVERGENT_LLM_BASE_URL` · each node self-heartbeats via a systemd timer
-(Linux) / scheduled task or service (Windows) · NVLink-pair domains launched as
-one tensor-parallel endpoint · richer capacity signal from the nvidia exporter
-(VRAM/util/topology) feeding the same rows · `epoch`-stamped backend-side reject
-for stale routers.
+expiry) so K-fan-out is exclusive, not advisory · each node self-heartbeats via a
+systemd timer (Linux) / scheduled task or service (Windows) · NVLink-pair domains
+launched as one tensor-parallel endpoint · richer capacity signal from the nvidia
+exporter (VRAM/util/topology) feeding the same rows · `epoch`-stamped backend-side
+reject for stale routers.
