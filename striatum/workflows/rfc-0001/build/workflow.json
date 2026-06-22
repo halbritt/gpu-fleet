@@ -6,10 +6,11 @@
   "branch": {
     "allow_dirty": false,
     "mode": "confirm",
-    "suggested_name": "striatum/rfc-0001-build"
+    "suggested_name": "striatum/rfc-0001-build-2"
   },
   "context_docs": [
     {"path": "striatum/campaign/rfc-0001/design/COMMITTED_PLAN.md", "required": true},
+    {"path": "striatum/campaign/rfc-0001/build/PRIOR_FINDINGS_AND_BC1_SCOPE.md", "required": true},
     {"path": "docs/rfc/0001-exclusive-slot-leases.md", "required": true}
   ],
   "coordinator": {
@@ -46,7 +47,7 @@
     "require_disjoint_write_scopes": true
   },
   "cycles": [
-    {"from": "review", "to": "draft", "on_verdict": "needs_revision", "max_iterations": 1}
+    {"from": "review", "to": "draft", "on_verdict": "needs_revision", "max_iterations": 2}
   ],
   "edges": [
     {"from": "draft", "to": "review", "on": "completed"},

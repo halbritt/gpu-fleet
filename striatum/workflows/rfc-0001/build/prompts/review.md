@@ -1,7 +1,12 @@
 # Task — Verify the implementation against the RFC's falsifiable gate
 
 You are the verifier. Read the committed build plan, the RFC's "Falsifiable gate"
-section, the author's claim ledger, and the **actual diff** on disk.
+section, **`PRIOR_FINDINGS_AND_BC1_SCOPE.md`**, the author's claim ledger, and the
+**actual diff** on disk. For BC1, verify against the *scoped* criterion in
+`PRIOR_FINDINGS_AND_BC1_SCOPE.md` (BC1-A responsive abort wired into the production
+claim/dispatch/run_shard path; an honest test with **no synthetic `gpu_busy`/sleep
+handshake**; the irreducible residual documented), not BC1's literal wording. Accept
+only if BC1-A is in the production path and its test is honest and green.
 
 ## Verify (do the work yourself — do not take the ledger's word)
 

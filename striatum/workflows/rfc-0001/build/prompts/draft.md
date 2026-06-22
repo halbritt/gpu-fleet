@@ -1,12 +1,17 @@
 # Task — Implement the RFC per the committed build plan
 
-Context docs: the **committed build plan** from the design gate and the RFC itself.
-Implement the change as the plan's ordered slices, honoring every binding constraint
-the plan's ledger recorded.
+Context docs: the **committed build plan**, the RFC, and
+`PRIOR_FINDINGS_AND_BC1_SCOPE.md`. A prior build attempt was rejected by the verifier
+on BC1 — **read `PRIOR_FINDINGS_AND_BC1_SCOPE.md` first**; it refines BC1 into the
+achievable, testable scope (BC1-A responsive abort in the production path, an honest
+no-synthetic-wait test, and a documented irreducible residual) and **supersedes BC1's
+literal wording**. Implement the plan's ordered slices, honoring every binding
+constraint, and discharge BC1 exactly per that scope.
 
 ## Do
 
-- Write the migration SQL file `migrations/006_*.sql` exactly per the plan.
+- Write the migration SQL file as the **next unused** `migrations/0NN_*.sql` — note
+  `006_peecee_dense_27b.sql` already exists on master, so use **`007_exclusive_slot_leases.sql`**.
 - Implement the code changes (`pick_slot.py`, `di_fleet.py`, `bin/di-fleet`,
   `heartbeat*.py`, etc. — only what the plan's blast radius names).
 - Write/extend tests that map to **EACH** bullet of the RFC's "Falsifiable gate".
