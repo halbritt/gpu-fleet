@@ -1,0 +1,28 @@
+-- RFC 0003 — Stale-router epoch fencing (Slice A: the DB half).
+--
+-- Purely ADDITIVE: one nullable column, `lease_epoch`. It records, per HELD lease,
+-- the slot `epoch` the holder routed against at claim time. The renew fence then
+-- becomes a pure two-column SQL self-compare (`epoch = lease_epoch`) — the consumer
+-- carries no epoch state and the claim/renew/release Python signatures do not change.
+--
+-- The `epoch` column already exists (001_gpu_slots.sql: "node bumps on topology/model
+-- change; stale-router reject hook") and is REUSED as the change-counter; this
+-- migration does not touch it. Slice B (heartbeat.py) turns the dormant column on by
+-- bumping it on a routing-relevant capability change instead of clobbering it with the
+-- static config value every tick.
+--
+-- Blast radius: one new nullable column. Renames nothing, drops nothing, no default,
+-- no backfill, no index, no constraint.
+--
+-- Backward compatible / order-independent: the running heartbeat UPSERT never names
+-- `lease_epoch`, so it is unaffected the instant this DDL commits; a NULL `lease_epoch`
+-- means "fencing disabled for that lease" (Slice D's NULL-guard / BC3 rollout-drain
+-- arm). Safe to apply with `gpu-fleet-heartbeat` running; stop -> migrate -> start is
+-- optional and equally safe.
+--
+-- Reversibility (BC4): revert Slice D's di_fleet.py FIRST (its renew/claim queries
+-- reference lease_epoch), THEN drop the column. Do NOT drop this column while live
+-- Slice-D consumer code is deployed.
+ALTER TABLE gpu_slots ADD COLUMN IF NOT EXISTS lease_epoch BIGINT;  -- NULL = fence off
+
+-- Reverse: ALTER TABLE gpu_slots DROP COLUMN IF EXISTS lease_epoch;

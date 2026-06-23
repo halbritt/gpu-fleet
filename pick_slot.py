@@ -25,7 +25,7 @@ import json
 
 PICK = """
 SELECT node, endpoint_url, slot_id, served_model, latency_class, vram_free_mib,
-       capacity, nvlink_domain, probe_ms, lease_id, lease_expires
+       capacity, nvlink_domain, probe_ms, lease_id, lease_expires, epoch
 FROM gpu_slots
 WHERE alive
   AND heartbeat_ts > now() - interval '45 seconds'
@@ -43,7 +43,7 @@ LIMIT %(k)s::int
 
 COLS = ["node", "endpoint_url", "slot_id", "served_model", "latency_class",
         "vram_free_mib", "capacity", "nvlink_domain", "probe_ms",
-        "lease_id", "lease_expires"]
+        "lease_id", "lease_expires", "epoch"]
 
 
 def pick(conn, *, latency_class=None, model=None, min_vram=None, k=1, job=""):
@@ -55,7 +55,11 @@ def pick(conn, *, latency_class=None, model=None, min_vram=None, k=1, job=""):
     collapsing every row's hash to NULL (BC3).
 
     Each dict carries `lease_id` / `lease_expires` (so a consumer can claim what it
-    picked) and still carries `free_slots` aliased from `capacity` (BC2)."""
+    picked) and still carries `free_slots` aliased from `capacity` (BC2). It also
+    surfaces the slot's current `epoch` (RFC 0003): the lease fence is server-side
+    (di_fleet stamps `lease_epoch = epoch` at claim), so surfacing `epoch` is for
+    observability and the optional no-lease pre-flight compare — a re-pick after a
+    bump reads the NEW epoch here, never a stale one."""
     rows = conn.execute(
         PICK, {"latency_class": latency_class, "model": model,
                "min_vram": min_vram, "k": k, "job": job}

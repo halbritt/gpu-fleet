@@ -28,9 +28,9 @@ class RecordingConn:
 # A row tuple in PICK's exact column order (pick_slot.COLS).
 def _row(node="proximal", url="http://proximal:8081/v1", slot_id=0, model="m",
          lclass="interactive", vram=24000, capacity=1, nvlink=None, probe=12,
-         lease_id=None, lease_expires=None):
+         lease_id=None, lease_expires=None, epoch=0):
     return (node, url, slot_id, model, lclass, vram, capacity, nvlink, probe,
-            lease_id, lease_expires)
+            lease_id, lease_expires, epoch)
 
 
 # --------------------------------------------------------------------------- #
@@ -86,3 +86,19 @@ def test_pick_defaults_job_to_empty_string():
     pick_slot.pick(conn)
     _, params = conn.calls[0]
     assert params["job"] == ""
+
+
+# --------------------------------------------------------------------------- #
+# RFC 0003 gate-bullet-3 (reader side) — pick() surfaces the slot's CURRENT epoch
+# and served_model, so a re-pick after a bump lands on the NEW capability.
+# --------------------------------------------------------------------------- #
+def test_pick_surfaces_current_epoch_and_model():
+    # After an epoch bump the slot row carries the NEW epoch + served_model. pick()
+    # must surface both (it already returns the row; epoch is now in the SELECT/COLS),
+    # so a consumer claims/stamps against what pick reported — never a stale view.
+    conn = RecordingConn([_row(model="mistral-new", epoch=7)])
+    out = pick_slot.pick(conn)
+    sql, _ = conn.calls[0]
+    assert "epoch" in sql                       # epoch is in the PICK SELECT
+    assert out[0]["epoch"] == 7                  # surfaced verbatim from the row
+    assert out[0]["served_model"] == "mistral-new"

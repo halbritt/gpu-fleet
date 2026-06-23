@@ -42,7 +42,22 @@ ON CONFLICT (node, endpoint_url, slot_id) DO UPDATE SET
     gpu_util_pct=EXCLUDED.gpu_util_pct, loaded_model=EXCLUDED.loaded_model,
     served_model=EXCLUDED.served_model, max_context=EXCLUDED.max_context,
     latency_class=EXCLUDED.latency_class, free_slots=EXCLUDED.free_slots,
-    epoch=EXCLUDED.epoch, alive=EXCLUDED.alive, probe_ms=EXCLUDED.probe_ms,
+    -- RFC 0003: PRESERVE the existing epoch and bump it by 1 only when a
+    -- ROUTING-RELEVANT field changed, instead of clobbering it with the static
+    -- config value (%(epoch)s) every tick. The CASE compares the OLD row
+    -- (gpu_slots.*) against the incoming tick (EXCLUDED.*); IS DISTINCT FROM is
+    -- NULL-safe. vram_free_mib / gpu_util_pct are deliberately EXCLUDED from the
+    -- diff so expected VRAM/util churn never bumps epoch (no re-pick storms).
+    -- endpoint_url is part of the PK, so an endpoint change is a new INSERT row
+    -- (seeding epoch), never an in-place conflict (BC2 handles held leases on a
+    -- turned-over endpoint registry-side). A brand-new INSERT still seeds epoch
+    -- from %(epoch)s via the VALUES list above; only this conflict path changed.
+    epoch = gpu_slots.epoch + CASE
+        WHEN gpu_slots.served_model   IS DISTINCT FROM EXCLUDED.served_model
+          OR gpu_slots.nvlink_domain  IS DISTINCT FROM EXCLUDED.nvlink_domain
+          OR gpu_slots.max_context    IS DISTINCT FROM EXCLUDED.max_context
+        THEN 1 ELSE 0 END,
+    alive=EXCLUDED.alive, probe_ms=EXCLUDED.probe_ms,
     note=EXCLUDED.note, heartbeat_ts=now()
 """
 
@@ -170,6 +185,23 @@ def ollama_ondemand_liveness(
     )
 
 
+# BC1 (RFC 0003) — sticky discovery. The last served_model SUCCESSFULLY resolved for
+# an endpoint, keyed by endpoint_url. On a TRANSIENT /models failure discover_served_model
+# returns this cached value instead of flapping to the (often differing) static
+# `--served-model` tag. A flap would make the heartbeat write a distinct served_model,
+# bump epoch via the UPSERT CASE, fence a healthy holder's renew to zero rows, and force
+# a needless re-pick on the next good tick — the exact churn RFC 0003's gate excludes.
+# Keyed by endpoint so heartbeat_all's per-node probe threads stay independent (plain
+# dict get/set on distinct keys is atomic under the GIL; no lock needed).
+_DISCOVERED: dict[str, str] = {}
+
+
+def reset_discovery_cache() -> None:
+    """Clear the sticky-discovery cache. A test seam (so cross-test state never leaks);
+    also lets a caller drop stale entries if an endpoint is decommissioned."""
+    _DISCOVERED.clear()
+
+
 def discover_served_model(endpoint: str, fallback: str | None, timeout: float = 6.0) -> str | None:
     """Self-correct the served model from the endpoint.
 
@@ -177,14 +209,29 @@ def discover_served_model(endpoint: str, fallback: str | None, timeout: float = 
     so a node swapped from ollama to llama-server auto-updates with no reconfig.
     If it lists many (the ollama case), keep the configured tag and don't disrupt
     by probe-loading some arbitrary big model.
+
+    BC1 sticky discovery (RFC 0003): a TRANSIENT /models failure MUST NOT flap
+    served_model. Once we have successfully resolved an endpoint's served_model
+    (single-model id, or the static tag in the multi-model case) we cache it; on a
+    later transient failure we return that cached value rather than the differing
+    static `fallback`, so a network blip cannot bump epoch and evict a healthy lease.
+    The cache is updated only on a SUCCESSFUL /models read, so a genuine capability
+    change (a real, non-transient new answer) still flows through and is allowed to
+    bump epoch. Stickiness only PROTECTS a value already learned: before any success
+    a transient failure still degrades to the static `fallback` (today's behavior).
     """
     url = endpoint.rstrip("/") + "/models"
     try:
         with urllib.request.urlopen(url, timeout=timeout) as r:
             ids = [m.get("id") for m in json.load(r).get("data", []) if m.get("id")]
     except (urllib.error.URLError, OSError, json.JSONDecodeError, TimeoutError):
-        return fallback
-    return ids[0] if len(ids) == 1 else fallback
+        # Transient failure: stay sticky on the last good resolution for this endpoint;
+        # only fall back to the static tag if we have never resolved one.
+        return _DISCOVERED.get(endpoint, fallback)
+    resolved = ids[0] if len(ids) == 1 else fallback
+    if resolved is not None:
+        _DISCOVERED[endpoint] = resolved
+    return resolved
 
 
 def heartbeat_once(conn: psycopg.Connection, args) -> dict:

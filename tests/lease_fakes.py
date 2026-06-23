@@ -45,19 +45,47 @@ class FakeSlotDB:
                 "alive": s.get("alive", True),
                 "heartbeat_ts": self.now,
                 "vram_free_mib": s.get("vram_free_mib", 24000),
+                # RFC 0003: epoch is the change-counter; lease_epoch is what the
+                # holder routed against (stamped at claim, cleared at release).
+                "epoch": s.get("epoch", 0),
                 "lease_id": s.get("lease_id"),
                 "lease_holder": s.get("lease_holder"),
                 "lease_expires": s.get("lease_expires"),
+                "lease_epoch": s.get("lease_epoch"),
+                # Whether this PK row is still being heartbeated. advance() refreshes
+                # only heartbeating rows, so a turned-over endpoint (BC2) can AGE out
+                # of the 45s live window while the rest of the fleet stays fresh.
+                "_heartbeating": s.get("_heartbeating", True),
             }
 
     # ---- test controls ----------------------------------------------------- #
     def advance(self, seconds):
-        """Wall-clock passes. The node keeps heartbeating (stays alive); only a
-        consumer's lease can lapse — models the RFC's autonomous-deadman clock."""
+        """Wall-clock passes. A node that is still heartbeating keeps its row fresh
+        (stays alive); only a consumer's lease can lapse — models the RFC's
+        autonomous-deadman clock. A row marked `_heartbeating=False` (an endpoint that
+        turned over, BC2) is NOT refreshed, so it ages out of the 45s live window."""
         with self._lock:
             self.now += float(seconds)
             for r in self.rows.values():
-                r["heartbeat_ts"] = self.now
+                if r["_heartbeating"]:
+                    r["heartbeat_ts"] = self.now
+
+    def turnover_endpoint(self, node, slot_id, old_url, new_url, *, epoch=0):
+        """Model BC2 endpoint turnover: the node moves (node, slot_id) to a NEW
+        endpoint_url — a new, freshly-heartbeated PK row — and STOPS heartbeating the
+        OLD PK row (which still holds its lease). After a subsequent advance() past the
+        45s window, the old row ages out of `live_slots` while its lease is unexpired,
+        so its renew is fenced by the freshness term."""
+        with self._lock:
+            old = self.rows[(node, old_url, slot_id)]
+            old["_heartbeating"] = False  # no longer refreshed -> heartbeat_ts ages out
+            key = (node, new_url, slot_id)
+            self.rows[key] = {
+                "node": node, "endpoint_url": new_url, "slot_id": slot_id,
+                "alive": True, "heartbeat_ts": self.now, "vram_free_mib": 24000,
+                "epoch": epoch, "lease_id": None, "lease_holder": None,
+                "lease_expires": None, "lease_epoch": None, "_heartbeating": True,
+            }
 
     def close(self):
         # run_leased_shard's finally calls conn.close(); the shared fake survives it.
@@ -108,14 +136,21 @@ class FakeSlotDB:
         row["lease_id"] = lid
         row["lease_holder"] = p["holder"]
         row["lease_expires"] = self.now + p["ttl"]
+        row["lease_epoch"] = row["epoch"]  # RFC 0003 D.1: stamp the epoch routed against
         self.issued.append(lid)
         return [(lid,)]
 
     def _renew(self, p):
         for row in self.rows.values():
+            # RFC 0003 D.2: the renew predicate now also requires the slot's epoch to
+            # still match what was stamped (NULL arm = pre-Slice-D in-flight lease, BC3)
+            # AND the leased row to still be the live, fresh heartbeated endpoint (BC2).
             if (row["lease_id"] == p["lease_id"]
                     and row["lease_expires"] is not None
-                    and self.now < row["lease_expires"]):
+                    and self.now < row["lease_expires"]
+                    and (row["lease_epoch"] is None
+                         or row["epoch"] == row["lease_epoch"])
+                    and self._fresh(row)):
                 row["lease_expires"] = self.now + p["ttl"]
                 return [(row["lease_id"],)]
         return []
@@ -126,6 +161,7 @@ class FakeSlotDB:
                 row["lease_id"] = None
                 row["lease_holder"] = None
                 row["lease_expires"] = None
+                row["lease_epoch"] = None  # RFC 0003 D.3/BC3: cleared WITH lease_id
         return []
 
 
