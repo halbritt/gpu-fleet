@@ -183,6 +183,44 @@ WHERE (node, slot_id) NOT IN (SELECT node, slot_id FROM fleet_nodes WHERE enable
 # delete a live self-pushed node on the very next tick.
 
 
+# RFC 0002 Slice 3 (single-writer, C9) — the puller RE-VALIDATES the per-node
+# driver-lease at WRITE time, not only at FETCH time. The FETCH is a snapshot; the
+# concurrent probe phase that follows it takes seconds, and a self-pusher can acquire
+# the node's lease in that window (after the puller fetched it as eligible, before the
+# puller writes its probed row). Skipping that re-check is the fetch->probe->write race:
+# both writers would land a row for the same node in the contending tick. This guard
+# closes it. It locks the fleet_nodes row (FOR UPDATE) and re-tests the lease, so the
+# decision serializes against the self-push NODE_LEASE_CAS (an UPDATE of the same row):
+# if a FRESH push-lease now owns the node, the puller writes ZERO rows for it this tick
+# and the self-pusher is the sole writer. Freshness is the DB clock (now() < lease_until),
+# never the puller host's (BC4/C12). A node with NO fleet_nodes row is never in the
+# puller's FETCH, so this guard never runs for it (BC1 self-push registration is untouched).
+PULL_WRITE_GUARD = """
+SELECT 1 FROM fleet_nodes
+ WHERE node = %(node)s AND slot_id = %(slot_id)s
+   AND driven_by IS NOT NULL
+   AND now() < lease_until
+ FOR UPDATE
+"""
+
+
+def pull_write(conn: psycopg.Connection, row: dict) -> bool:
+    """Write one probed PULL row through the per-node single-writer guard, in ONE
+    transaction. Returns True if the row was written, or False if a fresh push-lease
+    owns the node now (the puller YIELDS — the self-pusher is the sole writer for that
+    node this tick, C9). The guard SELECT ... FOR UPDATE and the UPSERT commit together,
+    so the lease re-check and the write are atomic and serialize against the self-push
+    NODE_LEASE_CAS. This is the write-time half of the single-writer guarantee whose
+    FETCH-time half is the FETCH lease predicate."""
+    if conn.execute(PULL_WRITE_GUARD,
+                    {"node": row["node"], "slot_id": row["slot_id"]}).fetchone():
+        conn.rollback()      # a self-pusher leased this node since the FETCH -> yield
+        return False
+    conn.execute(UPSERT, row)
+    conn.commit()
+    return True
+
+
 def tick(conn: psycopg.Connection, *, holder: str | None = None,
          lease_ttl: int = PULLER_LEASE_TTL, acquire_fn=acquire_puller_lease) -> list[dict]:
     # RFC 0002 Slice 2: when run as a peer-runnable driver (holder set), only the
@@ -193,17 +231,23 @@ def tick(conn: psycopg.Connection, *, holder: str | None = None,
         return []
     nodes = [dict(zip(COLS, r)) for r in conn.execute(FETCH).fetchall()]
     out = []
-    # Probe concurrently; commit each node's row the moment its probe lands, so a
-    # slow node never delays the heartbeat (heartbeat_ts) of the fast ones.
+    # Probe concurrently; write each node's row the moment its probe lands (so a slow
+    # node never delays the heartbeat of the fast ones), through the single-writer guard
+    # so a node a self-pusher leased DURING this probe phase is yielded, not double-written.
     for row in probe_each(nodes, probe_fn=probe_node):
+        skipped = False
         try:
-            conn.execute(UPSERT, row)
-            conn.commit()
+            skipped = not pull_write(conn, row)   # C9: yield a now-push-held node
         except Exception as exc:  # one bad row never stops the others
             conn.rollback()
             row = {**row, "alive": False, "note": f"upsert failed: {exc}"}
-        out.append({"node": row["node"], "alive": row["alive"], "probe_ms": row["probe_ms"],
-                    "vram_free_mib": row["vram_free"], "note": row["note"]})
+        if skipped:
+            out.append({"node": row["node"], "alive": None, "probe_ms": None,
+                        "vram_free_mib": None,
+                        "note": "skipped: self-push holds the node (single-writer C9)"})
+        else:
+            out.append({"node": row["node"], "alive": row["alive"], "probe_ms": row["probe_ms"],
+                        "vram_free_mib": row["vram_free"], "note": row["note"]})
     # Autonomous decommission: drop directory rows we no longer track (node
     # removed or disabled in fleet_nodes), so a retired node fully disappears.
     conn.execute(PRUNE)

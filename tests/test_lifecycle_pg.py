@@ -270,18 +270,91 @@ def test_push_and_pull_never_both_write(db):
 
 
 # --------------------------------------------------------------------------- #
-# Gate "Anti-lie" (F) — a node DECLARING a big context whose MEASURED probe shows small
-# free VRAM is not instantly routable (starts unverified), and once graduated routing
-# reads only the MEASURED columns: a claim needing more VRAM than measured is rejected.
+# Gate "Single writer" (H, the REAL race / C9) — the FETCH-time skip above is only HALF
+# the guarantee. A self-pusher can lease a node AFTER the puller fetched it as eligible
+# but BEFORE the puller writes its probed row (the concurrent probe phase is seconds
+# long). TWO REAL transactions: the puller fetches 'quad' eligible and builds a probed
+# row; a self-pusher then acquires the per-node lease and writes the slot in its own
+# transaction; the puller's WRITE-time guard (pull_write) must YIELD -> write ZERO rows,
+# so the registry row is the PUSHER's, never clobbered by the puller's stale fetch. Then,
+# once the push-lease lapses, the puller RESUMES writing (the guard does not over-skip).
 # --------------------------------------------------------------------------- #
-def test_big_declared_small_measured_not_routable(db):
+def test_pull_yields_when_push_acquires_after_fetch(db):
+    setup = db()
+    setup.execute("INSERT INTO fleet_nodes (node, slot_id, endpoint_url, served_model) "
+                  "VALUES ('quad', 0, 'http://quad:8081/v1', 'm')")
+    # 1) Puller FETCHes 'quad' as eligible (driven_by NULL) and builds its probed row.
+    assert "quad" in [r[0] for r in setup.execute(heartbeat_all.FETCH).fetchall()]
+    stale_pull_row = _hb_row(node="quad", endpoint="http://quad:8081/v1",
+                             served_model="m-PULL", boot_epoch=None, vram_free=10000)
+
+    # 2) A self-pusher acquires the per-node lease and writes the slot, in its OWN txn.
+    push = db()
+    push.execute(heartbeat.NODE_LEASE_CAS,
+                 {"me": "push/quad", "node": "quad", "slot_id": 0,
+                  "node_ttl": heartbeat.NODE_LEASE_TTL})
+    push.execute(heartbeat.UPSERT, _hb_row(node="quad", endpoint="http://quad:8081/v1",
+                                           served_model="m-PUSH", boot_epoch=4242,
+                                           vram_free=22000))
+
+    # 3) The puller now writes its STALE fetched row through the write-time guard. The
+    #    node is push-held now, so the guard YIELDS and the puller writes ZERO rows.
+    puller = psycopg.connect(TEST_DB)          # non-autocommit: guard + upsert = one txn
+    try:
+        wrote = heartbeat_all.pull_write(puller, stale_pull_row)
+    finally:
+        puller.close()
+    assert wrote is False, "the puller must YIELD a node a self-pusher leased after the FETCH (C9)"
+    r = setup.execute("SELECT served_model, boot_epoch FROM gpu_slots "
+                      "WHERE node='quad'").fetchone()
+    assert r == ("m-PUSH", 4242), f"the puller's stale write must not land; got {r}"
+
+    # 4) When the push-lease lapses, the puller RESUMES writing the node (no over-skip).
+    setup.execute("UPDATE fleet_nodes SET lease_until = now() - interval '1 second' "
+                  "WHERE node='quad'")
+    puller2 = psycopg.connect(TEST_DB)
+    try:
+        wrote2 = heartbeat_all.pull_write(
+            puller2, _hb_row(node="quad", endpoint="http://quad:8081/v1",
+                             served_model="m-PULL2", boot_epoch=None))
+    finally:
+        puller2.close()
+    assert wrote2 is True, "the puller must RESUME writing once the push-lease lapsed"
+    assert setup.execute("SELECT served_model FROM gpu_slots WHERE node='quad'"
+                         ).fetchone()[0] == "m-PULL2"
+
+
+# --------------------------------------------------------------------------- #
+# Gate "Anti-lie" — the RFC bullet has TWO halves, proven SEPARATELY so each is literal:
+#   (a) NEVER GRADUATES: a node claiming a big GPU whose probe shows it cannot actually
+#       serve (alive=False) never increments its streak, so it never reaches routable and
+#       never enters routable_slots — no number of lying ticks promotes it.
+#   (b) ROUTES ONLY MEASURED: a node with a REAL but small GPU DOES graduate on its live
+#       ticks (Q2 — a working small card is legitimately routable), but routing reads only
+#       the MEASURED columns, so it routes its measured throughput, never the big DECLARED
+#       capability — a claim needing more VRAM than measured is rejected.
+# --------------------------------------------------------------------------- #
+def test_failed_probe_big_declared_never_graduates(db):
+    conn = db()
+    # Declares a huge context + an A100-80G served model, but the probe never passes
+    # (alive=False every tick): the streak never increments, so it can never graduate.
+    for _ in range(heartbeat.GRADUATION_STREAK + 2):
+        _upsert(conn, max_context=200000, vram_free=80000, gpu_uuid="U1",
+                served_model="A100-80G", alive=False)
+    assert _status(conn) == "unverified", "a node that never serves must never graduate"
+    assert _in_routable(conn) is False
+    # It cannot lie itself into routing: even a zero-VRAM claim is refused (not routable).
+    assert leases.claim(conn, SLOT, "consumer", model_mib=0) is None
+
+
+def test_big_declared_small_measured_routes_only_measured(db):
     conn = db()
     _upsert(conn, max_context=200000, vram_free=512, gpu_uuid="U1", served_model="m")
     assert _status(conn) == "unverified"
-    assert _in_routable(conn) is False                 # not instantly routable (anti-lie)
+    assert _in_routable(conn) is False                 # not instantly routable (quarantine)
     for _ in range(heartbeat.GRADUATION_STREAK - 1):
         _upsert(conn, max_context=200000, vram_free=512, gpu_uuid="U1", served_model="m")
-    assert _status(conn) == "routable"                 # graduates on liveness (Q2)
+    assert _status(conn) == "routable"                 # a REAL small GPU graduates (Q2)
     # routing reads MEASURED vram_free (512), not the DECLARED 200000-token context:
     assert leases.claim(conn, SLOT, "consumer", model_mib=20000) is None
     assert leases.claim(conn, SLOT, "consumer", model_mib=256) is not None

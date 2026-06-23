@@ -9,6 +9,7 @@ both_write`. Here we pin the structural invariants that keep that behavior hones
 """
 
 import inspect
+import re
 
 import heartbeat
 import heartbeat_all as ha
@@ -61,3 +62,37 @@ def test_push_lease_cas_does_not_gate_the_upsert():
     assert "conn.execute(UPSERT, row)" in src
     # the UPSERT is at function indent (unconditional), not nested under an `if` on the CAS.
     assert "\n    conn.execute(UPSERT, row)" in src
+
+
+# --------------------------------------------------------------------------- #
+# Gate "Single writer" (G, write-time half / C9) — the FETCH predicate is only HALF the
+# guarantee. The puller fetches a snapshot, then probes concurrently for SECONDS; a
+# self-pusher can lease a node in that window, AFTER the puller fetched it as eligible
+# but BEFORE the puller writes. So the puller ALSO re-validates the per-node lease at
+# WRITE time and yields a now-push-held node. The two-transaction proof that the loser
+# (puller) writes ZERO rows lives in the guarded
+# test_lifecycle_pg.py::test_pull_yields_when_push_acquires_after_fetch; here we pin the
+# structural invariants that keep that backstop honest.
+# --------------------------------------------------------------------------- #
+def test_pull_write_guard_revalidates_lease_server_side():
+    # The guard re-tests the per-node lease with the DB clock and a row lock, so it
+    # serializes against the self-push CAS and reads no puller-host clock (BC4/C12).
+    assert "FOR UPDATE" in ha.PULL_WRITE_GUARD
+    assert "now() < lease_until" in ha.PULL_WRITE_GUARD
+    assert "driven_by IS NOT NULL" in ha.PULL_WRITE_GUARD
+    # only the node identity (PK) is bound; no client timestamp enters the skip decision.
+    params = set(re.findall(r"%\((\w+)\)s", ha.PULL_WRITE_GUARD))
+    assert params == {"node", "slot_id"}, f"guard must bind only the PK, got {params}"
+
+
+def test_tick_writes_through_the_single_writer_guard():
+    # tick() must route the puller's write through pull_write (the WRITE-time re-check),
+    # NOT a bare unconditional UPSERT that ignores a lease acquired since the FETCH.
+    src = inspect.getsource(ha.tick)
+    assert "pull_write(conn, row)" in src
+    assert "conn.execute(UPSERT, row)" not in src, \
+        "tick must not write the UPSERT unconditionally; it must go through pull_write"
+    # pull_write itself re-checks the guard and YIELDS (rolls back, writes zero rows)
+    # when a fresh push-lease owns the node.
+    pw = inspect.getsource(ha.pull_write)
+    assert "PULL_WRITE_GUARD" in pw and "conn.rollback()" in pw and "return False" in pw
