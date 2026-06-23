@@ -7,8 +7,10 @@ clock. They prove the lease LOGIC; the DB-only atomicity/concurrency properties 
 transactions racing, true rollback) are what the guarded PG tests add on top.
 """
 
+import pytest
+
 import di_fleet as leases  # the lease lifecycle lives in di_fleet (see CLAIM_LEDGER)
-from lease_fakes import FakeSlotDB
+from lease_fakes import FakeChild, FakeSlotDB
 
 SLOT = {"node": "proximal", "endpoint_url": "http://proximal:8081/v1", "slot_id": 0}
 
@@ -128,3 +130,103 @@ def test_failover_transfer_no_survivor_releases_dead_lease_immediately():
     out = leases.failover_transfer(db, dead, [s1], "consumer-A")
     assert out is None
     assert db.row_for(s0)["lease_id"] is None  # freed immediately, no TTL wait
+
+
+# =========================================================================== #
+# RFC 0003 — stale-router epoch fencing (Slice D). The lease renew gains the epoch
+# self-compare (gate-bullet-1) + the BC2 endpoint-turnover freshness term, and the
+# BC3 NULL-arm invariants. These drive the REAL LEASE_*_SQL through FakeSlotDB.
+# =========================================================================== #
+
+# --------------------------------------------------------------------------- #
+# Gate bullet 1 — a served_model bump fences the holder's next renew (forced
+# re-pick), proven by mutating the row mid-lease.  (RFC test "A")
+# --------------------------------------------------------------------------- #
+def test_epoch_change_fences_renew():
+    # The claim stamps lease_epoch = the slot's epoch (what the holder routed
+    # against). A heartbeat then bumps the slot's epoch (capability changed); the
+    # holder's next renew self-compares epoch != lease_epoch -> zero rows -> False.
+    db = _db()
+    lease = leases.claim(db, SLOT, "consumer-A", ttl_seconds=45)
+    row = db.row_for(SLOT)
+    assert row["lease_epoch"] == row["epoch"]        # stamped at claim
+    row["epoch"] += 1                                 # heartbeat bumps mid-lease
+    assert leases.renew(db, lease, ttl_seconds=45) is False  # fenced -> re-pick
+
+
+def test_epoch_bump_aborts_di_child_in_renew_path():
+    # The same fence end-to-end through the renew MONITOR: when the bump makes renew
+    # return zero rows, run_leased_shard terminates its di --json child in the SAME
+    # control path and raises LeaseLost (the inherited BC1-A abort — RFC 0003 only
+    # adds a new REASON renew returns zero rows; it never builds a second renewer).
+    db = _db()
+    child = FakeChild(runs_forever=True)
+
+    def bumping_sleep(_seconds):
+        # One renew interval passes; the node heartbeats a routing-relevant change,
+        # bumping epoch. The clock does NOT advance, so the lease is still unexpired
+        # and the row still fresh — the epoch mismatch is the ONLY cause of the loss.
+        db.row_for(SLOT)["epoch"] += 1
+
+    with pytest.raises(leases.LeaseLost):
+        leases.run_leased_shard(
+            SLOT, frames=3, flags=[], holder="consumer-A",
+            conn_factory=lambda: db, lease_ops=leases.leases,
+            child_factory=lambda *a: child,
+            ttl_seconds=45, renew_seconds=5, sleep=bumping_sleep)
+    assert child.terminated is True  # BC1-A: child killed in the renew path
+
+
+# --------------------------------------------------------------------------- #
+# BC2 — endpoint-turnover fence (hermetic companion of the PG test "H"). A held
+# lease is fenced once its leased PK row stops being the live, fresh heartbeated
+# endpoint for (node, slot_id), even though the lease itself is unexpired.
+# --------------------------------------------------------------------------- #
+def test_endpoint_turnover_fences_old_lease():
+    old = {"node": "peecee", "endpoint_url": "http://peecee:11434/v1", "slot_id": 0}
+    db = FakeSlotDB([old])
+    lease = leases.claim(db, old, "consumer-A", ttl_seconds=600)  # long TTL: not expiry
+    assert leases.renew(db, lease, ttl_seconds=600) is True       # fresh -> renews fine
+    # The node moves (peecee, slot 0) to a NEW endpoint_url (a new PK row); the old PK
+    # row stops being heartbeated. Time passes past the 45s window but well within the
+    # 600s lease, so the only thing that changed is the old row's freshness.
+    db.turnover_endpoint("peecee", 0, "http://peecee:11434/v1", "http://peecee:11435/v1")
+    db.advance(60)
+    assert leases.renew(db, lease, ttl_seconds=600) is False      # BC2 freshness fence
+
+
+# --------------------------------------------------------------------------- #
+# BC3 — keep the (lease_epoch IS NULL) rollout-drain arm and prove the bypass is
+# steady-state-unreachable.  (RFC tests "I", "J", "K")
+# --------------------------------------------------------------------------- #
+def test_post_rollout_claim_stamps_non_null_lease_epoch():
+    # (i) Every post-Slice-D claim stamps a NON-NULL lease_epoch, because epoch is
+    # NOT NULL DEFAULT 0 -> the NULL arm is unreachable for any newly-claimed lease.
+    db = _db()
+    leases.claim(db, SLOT, "consumer-A")
+    row = db.row_for(SLOT)
+    assert row["lease_epoch"] is not None
+    assert row["lease_epoch"] == row["epoch"]
+
+
+def test_null_lease_epoch_still_renews():
+    # (ii) A pre-Slice-D in-flight lease (lease_epoch never stamped -> NULL) still
+    # renews — the rollout-drain arm keeps it un-fenced for its one remaining TTL even
+    # if the slot's epoch churned, so deploying Slice D evicts no in-flight lease.
+    db = _db()
+    lease = leases.claim(db, SLOT, "consumer-A", ttl_seconds=45)
+    db.row_for(SLOT)["lease_epoch"] = None  # as if stamped by pre-upgrade code (unset)
+    db.row_for(SLOT)["epoch"] += 5          # capability churned underneath it
+    assert leases.renew(db, lease, ttl_seconds=45) is True
+
+
+def test_release_clears_lease_epoch_with_lease_id():
+    # (ii) release clears lease_epoch TOGETHER with lease_id, so no row ever carries a
+    # renewable lease_id alongside a stale lease_epoch (and no NULL-lease_epoch row
+    # carries a live lease).
+    db = _db()
+    lease = leases.claim(db, SLOT, "consumer-A")
+    assert db.row_for(SLOT)["lease_epoch"] is not None
+    leases.release(db, lease)
+    row = db.row_for(SLOT)
+    assert row["lease_id"] is None and row["lease_epoch"] is None

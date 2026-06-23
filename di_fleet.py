@@ -90,11 +90,18 @@ RENEW_SECONDS = 15  # TTL/3
 # CLAIM — atomic conditional UPDATE. Inherits #2's load-aware liveness (alive +
 # fresh heartbeat + vram_free) as a precondition, so a lease is never offered on a
 # dead node or a marker-owned (load-starved) GPU.
+#
+# RFC 0003 (Slice D.1): stamp `lease_epoch = epoch` in the SET — the RHS reads the
+# row's CURRENT epoch atomically in the same conditional UPDATE, recording the slot
+# capability this holder routed against. The renew fence (below) then self-compares
+# `epoch = lease_epoch` column-to-column, so the consumer carries NO epoch state and
+# `claim()`'s Python signature is unchanged.
 LEASE_CLAIM_SQL = """
 UPDATE gpu_slots
    SET lease_id      = gen_random_uuid(),
        lease_holder  = %(holder)s,
-       lease_expires = now() + make_interval(secs => %(ttl)s)
+       lease_expires = now() + make_interval(secs => %(ttl)s),
+       lease_epoch   = epoch
  WHERE (node, endpoint_url, slot_id) = (%(node)s, %(endpoint_url)s, %(slot_id)s)
    AND alive
    AND heartbeat_ts > now() - interval '45 seconds'
@@ -103,22 +110,47 @@ UPDATE gpu_slots
 RETURNING lease_id
 """
 
-# RENEW — every TTL/3. Zero rows = "lease lost (expired or re-claimed) — stop
-# touching the GPU immediately." The now() < lease_expires guard means a lapsed
-# lease cannot be silently resurrected by its old holder.
+# RENEW — every TTL/3. Zero rows = "lease lost — stop touching the GPU immediately."
+# The now() < lease_expires guard means a lapsed lease cannot be silently resurrected
+# by its old holder.
+#
+# RFC 0003 (Slice D.2) adds two more ways a renew returns zero rows, both server-side:
+#   * (lease_epoch IS NULL OR epoch = lease_epoch): the slot's routing-relevant
+#     capability changed under the holder (heartbeat bumped epoch) => fence. The
+#     NULL arm keeps a pre-Slice-D in-flight lease (lease_epoch never stamped)
+#     un-fenced for its one remaining TTL during the rollout drain (BC3 — DO NOT
+#     remove it; removing it would evict every in-flight lease at deploy).
+#   * alive AND heartbeat_ts within the SAME 45s live_slots window (BC2): the leased
+#     (node, endpoint_url, slot_id) row must still be the live, FRESH heartbeated
+#     endpoint. When the node turns over to a new endpoint_url (a new PK row), the
+#     old leased row stops being heartbeated, ages out of the 45s window, and this
+#     held lease's renew returns zero rows instead of renewing against a stale row.
+#     Reuses the 45s window verbatim (NOT tighter) so a transient heartbeat-driver
+#     outage does not fence every live lease.
+# The consumer's existing renew()==False => abort child + drop slot + re-pick path
+# (_monitor, BC1-A) handles all of these unchanged; it just gains more reasons to
+# see zero rows. claim()/renew()/release() signatures are untouched.
 LEASE_RENEW_SQL = """
 UPDATE gpu_slots
    SET lease_expires = now() + make_interval(secs => %(ttl)s)
  WHERE lease_id = %(lease_id)s
    AND now() < lease_expires
+   AND (lease_epoch IS NULL OR epoch = lease_epoch)
+   AND alive
+   AND heartbeat_ts > now() - interval '45 seconds'
 RETURNING lease_id
 """
 
 # RELEASE — fenced on lease_id, so releasing a lease we no longer hold (a successor
 # already re-claimed) matches zero rows and never clobbers the successor.
+#
+# RFC 0003 (Slice D.3 / BC3): clear `lease_epoch` TOGETHER with `lease_id`, so no
+# released row ever carries a renewable lease_id alongside a stale lease_epoch, and a
+# NULL-lease_epoch row never carries a live lease (the NULL renew arm stays reserved
+# strictly for pre-Slice-D in-flight leases draining within one TTL).
 LEASE_RELEASE_SQL = """
 UPDATE gpu_slots
-   SET lease_id = NULL, lease_holder = NULL, lease_expires = NULL
+   SET lease_id = NULL, lease_holder = NULL, lease_expires = NULL, lease_epoch = NULL
  WHERE lease_id = %(lease_id)s
 """
 

@@ -47,6 +47,11 @@ CREATE TABLE gpu_slots (
     lease_id      UUID,
     lease_holder  TEXT,
     lease_expires TIMESTAMPTZ,
+    -- RFC 0003: Slice D modifies the shared LEASE_CLAIM_SQL/LEASE_RENEW_SQL these
+    -- tests exercise (it stamps/compares epoch and lease_epoch), so this temp DDL
+    -- must carry both columns or the lease PG suite would error under GPU_FLEET_TEST_DB.
+    epoch         BIGINT NOT NULL DEFAULT 0,
+    lease_epoch   BIGINT,
     alive         BOOLEAN NOT NULL DEFAULT true,
     heartbeat_ts  TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (node, endpoint_url, slot_id)
