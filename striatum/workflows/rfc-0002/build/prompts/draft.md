@@ -2,7 +2,16 @@
 
 Context docs: the **committed build plan** from the design gate and the RFC itself.
 Implement the change as the plan's ordered slices, honoring every binding constraint
-the plan's ledger recorded.
+the plan's ledger recorded (BC1–BC8).
+
+**For BC8, take discharge option (a) — the inert one:** do NOT retire peecee's SSH
+`nvidia-smi` leg in v1. Keep peecee's existing (working) SSH-via-pull liveness, DELETE
+the operator SSH-retirement step from the plan's apply instructions, and narrow the
+"zero-SSH pull-only" wording so it claims only "no fleet code/creds on the node" (the
+node's liveness still uses an nvidia-smi side channel driven by the puller). Do NOT
+modify `probe_node` / `gpu_stats` / `ollama_ondemand_liveness` in `heartbeat.py` for
+BC8 — option (b) (a real HTTP-only peecee liveness path) is explicitly out of scope for
+this build. This keeps the build inert with respect to the live probe path.
 
 ## Do
 
