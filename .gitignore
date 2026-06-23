@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .striatum/
+
+# coordination/intero proof-of-life — local per-box, not history (showerthoughts coordination/intero/SPEC.md)
+.intero.json
