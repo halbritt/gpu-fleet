@@ -29,6 +29,7 @@ SELECT node, endpoint_url, slot_id, served_model, latency_class, vram_free_mib,
 FROM gpu_slots
 WHERE alive
   AND heartbeat_ts > now() - interval '45 seconds'
+  AND status = 'routable'                              -- RFC 0002: route only MEASURED-verified slots
   AND (lease_id IS NULL OR now() >= lease_expires)
   AND (%(latency_class)s::text IS NULL OR latency_class = %(latency_class)s::text)
   AND (%(model)s::text IS NULL OR served_model = %(model)s::text)

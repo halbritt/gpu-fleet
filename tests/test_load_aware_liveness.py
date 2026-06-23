@@ -267,3 +267,42 @@ def test_probe_node_ollama_ondemand_not_loadable_does_not_probe(monkeypatch):
     assert row["alive"] is False
     assert row["probe_ms"] is None
     assert "not loadable" in (row["note"] or "")
+
+
+# --- BC8 / gate "peecee runs zero fleet code/creds, still monitored via pull" ------
+# Companion to the de-list proof above (which v1 keeps under peecee's existing SSH-via-
+# pull liveness — option (a)): the pull path is PURE I/O. probe_node takes no DB
+# connection, returns an UPSERT-ready row written through the DRIVER's connection only,
+# and stamps boot_epoch NULL (an HTTP/SSH probe carries no boot identity, so no node
+# credential or boot token is asserted on peecee's behalf). The MEASURED gpu_uuid from
+# the puller's cross-host nvidia-smi is still carried (identity survives churn).
+
+def test_pull_only_node_has_no_db_path(monkeypatch):
+    import inspect
+
+    # probe_node is pure I/O: it accepts only a node dict (no conn parameter), so a
+    # pull-only node never has a database path of its own. (The caller owns the single
+    # DB connection — its docstring says so — so we assert on the CODE: no DB calls.)
+    sig = inspect.signature(ha.probe_node)
+    assert list(sig.parameters) == ["n"], "probe_node must take no DB connection"
+    src = inspect.getsource(ha.probe_node)
+    assert ".execute(" not in src and ".commit(" not in src and "psycopg" not in src
+
+    def fake_gpu_stats(cmd, timeout):
+        return {"gpu_model": "RTX 3090 Ti", "vram_total_mib": 24500,
+                "vram_free_mib": 24000, "gpu_util_pct": 0, "gpu_uuid": "GPU-PEECEE"}
+
+    monkeypatch.setattr(ha, "gpu_stats", fake_gpu_stats)
+    monkeypatch.setattr(hb, "ollama_resident", lambda *a, **k: False)  # cold-loadable
+
+    node = {
+        "node": "peecee", "slot_id": 0, "endpoint_url": "http://peecee:11434/v1",
+        "served_model": "qwen3.6:35b-a3b", "probe_model": "ollama-ondemand",
+        "latency_class": "batch", "gpu_cmd": "ssh peecee nvidia-smi",
+        "nvlink_domain": None, "max_context": 32768, "free_slots": 1, "epoch": 0,
+        "min_load_vram_mib": 23000,
+    }
+    row = ha.probe_node(node)
+    assert row["alive"] is True                  # loadable -> still monitored via pull
+    assert row["boot_epoch"] is None             # pull asserts NO boot identity (ratchet inert)
+    assert row["gpu_uuid"] == "GPU-PEECEE"       # measured identity still carried (BC7/J)

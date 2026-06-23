@@ -52,6 +52,11 @@ CREATE TABLE gpu_slots (
     -- must carry both columns or the lease PG suite would error under GPU_FLEET_TEST_DB.
     epoch         BIGINT NOT NULL DEFAULT 0,
     lease_epoch   BIGINT,
+    -- RFC 0002: the Slice-4 claim gate adds `AND status = 'routable'` to LEASE_CLAIM_SQL,
+    -- so this temp DDL must carry the column or the lease PG suite would error. Default
+    -- 'routable' so the seeded live slots are claimable exactly as before this RFC.
+    status        TEXT NOT NULL DEFAULT 'routable'
+        CHECK (status IN ('unverified','probationary','routable','demoted')),
     alive         BOOLEAN NOT NULL DEFAULT true,
     heartbeat_ts  TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (node, endpoint_url, slot_id)

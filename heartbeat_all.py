@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import socket
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -27,14 +29,54 @@ from heartbeat import (
     ollama_ondemand_liveness,
 )
 
+# RFC 0002 Slice 3 Change B — the puller SKIPS a node whose per-node driver-lease is
+# held-and-FRESH (a self-pusher owns it), and probes the rest. Freshness is decided
+# SERVER-SIDE by the DB clock (now() >= lease_until), never the puller host's clock
+# (BC4/C12) — so push and pull never both write a node (C9). With driven_by NULL /
+# lease_until expired everywhere (today) this reduces to `WHERE enabled` = today's
+# behavior, so the puller drives every node until a push sidecar is deployed.
 FETCH = """
 SELECT node, slot_id, endpoint_url, served_model, probe_model, latency_class,
        gpu_cmd, nvlink_domain, max_context, free_slots, epoch, min_load_vram_mib
-FROM fleet_nodes WHERE enabled ORDER BY node, slot_id
+FROM fleet_nodes
+WHERE enabled AND (driven_by IS NULL OR now() >= lease_until)
+ORDER BY node, slot_id
 """
 COLS = ["node", "slot_id", "endpoint_url", "served_model", "probe_model",
         "latency_class", "gpu_cmd", "nvlink_domain", "max_context", "free_slots",
         "epoch", "min_load_vram_mib"]
+
+# RFC 0002 Slice 2 — global puller-lease (peer-runnable driver; kills the SPOF). A CAS
+# on the single fleet_meta row: the holder drives the tick and renews; a standby loses
+# the CAS and idles. Column `holder` is identical in the DDL, this CAS, and the tests
+# (BC5). Deadman TTL = PULLER_LEASE_TTL, pinned strictly below the 45s live window (BC3)
+# so a killed holder's standby takes over and writes fresh heartbeats well before any
+# live slot ages out. `now() >= lease_until` is server-side, so standby clock skew
+# cannot mis-time the takeover (C12).
+PULLER_LEASE_TTL = 15
+
+PULLER_LEASE_CAS = """
+UPDATE fleet_meta
+   SET holder = %(me)s, lease_until = now() + make_interval(secs => %(ttl)s)
+ WHERE id = 1
+   AND (holder IS NULL OR now() >= lease_until OR holder = %(me)s)
+RETURNING holder
+"""
+
+
+def puller_id() -> str:
+    """Identity this driver writes into the puller-lease (host/pid). A lone puller wins
+    the CAS trivially and renews each tick; a second puller idles instead of double-driving."""
+    return f"puller/{socket.gethostname()}/{os.getpid()}"
+
+
+def acquire_puller_lease(conn, holder: str, ttl: int = PULLER_LEASE_TTL) -> bool:
+    """Try to hold (or renew) the global puller-lease. Returns True if THIS driver holds
+    it for the next tick. The CAS is committed immediately so a standby on another host
+    sees the takeover. Freshness/expiry is decided by the DB clock, never a host clock."""
+    row = conn.execute(PULLER_LEASE_CAS, {"me": holder, "ttl": ttl}).fetchone()
+    conn.commit()
+    return row is not None
 
 # Fast-fail probe budgets. A liveness probe must resolve quickly: with nodes
 # probed concurrently, the tick is as slow as the slowest probe, so each leg is
@@ -81,6 +123,10 @@ def probe_node(n: dict) -> dict:
         "served_model": served, "max_context": n["max_context"],
         "latency_class": n["latency_class"], "free_slots": n["free_slots"],
         "epoch": n["epoch"], "alive": alive, "probe_ms": probe_ms, "note": note,
+        # RFC 0002: the pull driver carries the MEASURED gpu_uuid (from nvidia-smi,
+        # local or cross-host SSH) but leaves boot_epoch NULL — an HTTP/SSH probe has
+        # no boot identity to stamp, so the ratchet stays inert for pull-driven rows.
+        "gpu_uuid": stats.get("gpu_uuid"), "boot_epoch": None,
     }
 
 
@@ -95,6 +141,9 @@ def _failed_row(n: dict, exc: Exception) -> dict:
         "max_context": n.get("max_context"), "latency_class": n.get("latency_class"),
         "free_slots": n.get("free_slots"), "epoch": n.get("epoch"),
         "alive": False, "probe_ms": None, "note": f"probe crashed: {exc}",
+        # NOT alive -> the UPSERT zeroes the streak / re-quarantines; a NULL uuid here
+        # COALESCE-preserves any known identity, and boot_epoch stays inert (pull).
+        "gpu_uuid": None, "boot_epoch": None,
     }
 
 
@@ -124,10 +173,24 @@ def probe_all(nodes: list[dict], probe_fn=None, max_workers: int | None = None) 
 PRUNE = """
 DELETE FROM gpu_slots
 WHERE (node, slot_id) NOT IN (SELECT node, slot_id FROM fleet_nodes WHERE enabled)
+  AND heartbeat_ts <= now() - interval '45 seconds'
 """
+# RFC 0002 Slice 1 Change C (C3-PRUNE): delete only rows that are BOTH absent from
+# enabled fleet_nodes AND already stale. A self-pushed node with no fleet_nodes row
+# keeps its row FRESH, so it is never pruned (that is what lets "registration = first
+# heartbeat" coexist with the pull driver's housekeeping); a genuinely removed/disabled
+# node goes stale first, then is pruned. WITHOUT the staleness term the PRUNE would
+# delete a live self-pushed node on the very next tick.
 
 
-def tick(conn: psycopg.Connection) -> list[dict]:
+def tick(conn: psycopg.Connection, *, holder: str | None = None,
+         lease_ttl: int = PULLER_LEASE_TTL, acquire_fn=acquire_puller_lease) -> list[dict]:
+    # RFC 0002 Slice 2: when run as a peer-runnable driver (holder set), only the
+    # puller that HOLDS the global fleet_meta lease drives this tick; a standby that
+    # loses the CAS idles, so two pullers never double-write a node. `holder=None`
+    # (a direct/test call) skips the lease and drives unconditionally = today's behavior.
+    if holder is not None and not acquire_fn(conn, holder, lease_ttl):
+        return []
     nodes = [dict(zip(COLS, r)) for r in conn.execute(FETCH).fetchall()]
     out = []
     # Probe concurrently; commit each node's row the moment its probe lands, so a
@@ -152,12 +215,18 @@ def main() -> int:
     p = argparse.ArgumentParser(description="gpu-fleet heartbeat driver")
     p.add_argument("--db", default="dbname=gpu_fleet")
     p.add_argument("--interval", type=float, default=15.0, help="seconds; 0 = once")
+    p.add_argument("--no-puller-lease", action="store_true",
+                   help="drive every tick without the peer-runnable puller-lease "
+                        "(single-driver mode; the lease is the SPOF-killer, on by default)")
     a = p.parse_args()
+    # RFC 0002 Slice 2: peer-runnable by default — hold the global puller-lease to drive,
+    # idle if a peer holds it. A lone driver wins the CAS trivially (today's behavior).
+    holder = None if a.no_puller_lease else puller_id()
     with psycopg.connect(a.db, autocommit=False) as conn:
         while True:
             t0 = time.monotonic()
             try:
-                res = tick(conn)
+                res = tick(conn, holder=holder)
             except Exception as exc:
                 # A tick-level failure (a transient DB error, or FETCH meeting a
                 # schema mid-migration) must NOT crash this always-on driver: under

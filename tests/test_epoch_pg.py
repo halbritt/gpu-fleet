@@ -41,17 +41,25 @@ import heartbeat  # noqa: E402  the real UPSERT + sticky discover_served_model
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _MIGRATIONS = os.path.join(_ROOT, "migrations")
-# The real migrations that shape gpu_slots: 001 creates it (with epoch), 007 adds the
-# lease columns + capacity, 008 adds lease_epoch. Applying them proves they apply
+# The real migrations that shape gpu_slots: 001 creates it (with epoch), 002 creates
+# fleet_nodes (009 alters it), 007 adds the lease columns + capacity, 008 adds
+# lease_epoch, 009 adds the RFC-0002 status/probe_streak/gpu_uuid/boot_epoch columns the
+# revised UPSERT writes + fleet_meta + routable_slots. Applying them proves they apply
 # cleanly AND that the SQL under test runs against the real schema.
-_FILES = ("001_gpu_slots.sql", "007_exclusive_slot_leases.sql", "008_lease_epoch.sql")
+_FILES = ("001_gpu_slots.sql", "002_fleet_nodes.sql", "007_exclusive_slot_leases.sql",
+          "008_lease_epoch.sql", "009_zero_touch_lifecycle.sql")
 
 NODE, URL, SLOT_ID = "t", "http://t:8081/v1", 0
 SLOT = {"node": NODE, "endpoint_url": URL, "slot_id": SLOT_ID}
 
 
 def _apply_migrations(conn):
-    conn.execute("DROP TABLE IF EXISTS gpu_slots CASCADE")  # also drops the live_slots view
+    # gpu_slots CASCADE also drops live_slots + routable_slots (009); fleet_nodes /
+    # fleet_meta are dropped explicitly so re-applying 002/009 (CREATE TABLE without
+    # IF NOT EXISTS for fleet_nodes) is idempotent across the function-scoped fixture.
+    conn.execute("DROP TABLE IF EXISTS gpu_slots CASCADE")
+    conn.execute("DROP TABLE IF EXISTS fleet_nodes CASCADE")
+    conn.execute("DROP TABLE IF EXISTS fleet_meta CASCADE")
     conn.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")  # gen_random_uuid on < PG13
     for fname in _FILES:
         with open(os.path.join(_MIGRATIONS, fname), encoding="utf-8") as f:
@@ -67,9 +75,22 @@ def _hb_row(**over):
         "loaded_model": "llama-3", "served_model": "llama-3", "max_context": 8192,
         "latency_class": "batch", "free_slots": 1, "epoch": 0,
         "alive": True, "probe_ms": 12, "note": None,
+        # RFC 0002 columns the revised UPSERT writes; pull-style defaults (boot_epoch
+        # NULL => ratchet inert, gpu_uuid NULL => identity unknown) keep these epoch
+        # tests focused on `epoch`, not the quarantine ratchet.
+        "gpu_uuid": None, "boot_epoch": None,
     }
     row.update(over)
     return row
+
+
+def _seed_routable(conn, **over):
+    """Seed a slot via the REAL UPSERT, then graduate it. A fresh UPSERT correctly
+    enters status='unverified' (RFC 0002), but the Slice-4 claim gate requires
+    'routable'; these epoch tests exercise the lease lifecycle, not graduation, so we
+    mark it routable once. Later same-uuid alive ticks keep it routable (the CASE)."""
+    conn.execute(heartbeat.UPSERT, _hb_row(**over))
+    conn.execute("UPDATE gpu_slots SET status = 'routable'")
 
 
 def _epoch(conn):
@@ -93,6 +114,8 @@ def db():
     yield connect
     with psycopg.connect(TEST_DB, autocommit=True) as teardown:
         teardown.execute("DROP TABLE IF EXISTS gpu_slots CASCADE")
+        teardown.execute("DROP TABLE IF EXISTS fleet_nodes CASCADE")
+        teardown.execute("DROP TABLE IF EXISTS fleet_meta CASCADE")
 
 
 # --------------------------------------------------------------------------- #
@@ -101,7 +124,7 @@ def db():
 # --------------------------------------------------------------------------- #
 def test_served_model_bump_fences_renew(db):
     conn = db()
-    conn.execute(heartbeat.UPSERT, _hb_row(served_model="llama-3"))  # seed via real UPSERT
+    _seed_routable(conn, served_model="llama-3")  # seed via real UPSERT, then graduate
     assert _epoch(conn) == 0
     lease = leases.claim(conn, SLOT, "consumer-A")  # routes against epoch 0
     assert lease is not None
@@ -118,7 +141,7 @@ def test_served_model_bump_fences_renew(db):
 # --------------------------------------------------------------------------- #
 def test_vram_util_only_change_keeps_epoch_and_lease(db):
     conn = db()
-    conn.execute(heartbeat.UPSERT, _hb_row(vram_free=22000, util=5))
+    _seed_routable(conn, vram_free=22000, util=5)
     lease = leases.claim(conn, SLOT, "consumer-A")
     assert lease is not None
     # Only VRAM/util churn — NOT a routing-relevant field.
@@ -133,7 +156,7 @@ def test_vram_util_only_change_keeps_epoch_and_lease(db):
 # --------------------------------------------------------------------------- #
 def test_repick_after_bump_stamps_new_epoch(db):
     conn = db()
-    conn.execute(heartbeat.UPSERT, _hb_row(served_model="llama-3"))
+    _seed_routable(conn, served_model="llama-3")
     lease1 = leases.claim(conn, SLOT, "consumer-A")
     conn.execute(heartbeat.UPSERT, _hb_row(served_model="mistral"))  # capability changed
     assert _epoch(conn) == 1
@@ -156,7 +179,7 @@ def test_endpoint_turnover_fences_old_lease(db):
     conn = db()
     old_url, new_url = "http://peecee:11434/v1", "http://peecee:11435/v1"
     old = {"node": "peecee", "endpoint_url": old_url, "slot_id": 0}
-    conn.execute(heartbeat.UPSERT, _hb_row(node="peecee", endpoint=old_url))
+    _seed_routable(conn, node="peecee", endpoint=old_url)
     lease = leases.claim(conn, old, "consumer-A", ttl_seconds=600)  # long TTL: not expiry
     assert lease is not None
     assert leases.renew(conn, lease, ttl_seconds=600) is True  # still fresh -> renews
