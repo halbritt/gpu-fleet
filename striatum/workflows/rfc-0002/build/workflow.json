@@ -6,9 +6,10 @@
   "branch": {
     "allow_dirty": false,
     "mode": "confirm",
-    "suggested_name": "striatum/rfc-0002-build"
+    "suggested_name": "striatum/rfc-0002-build-2"
   },
   "context_docs": [
+    {"path": "striatum/campaign/rfc-0002/build/PRIOR_FINDINGS.md", "required": true},
     {"path": "striatum/campaign/rfc-0002/design/COMMITTED_PLAN.md", "required": true},
     {"path": "docs/rfc/0002-zero-touch-node-lifecycle.md", "required": true}
   ],
