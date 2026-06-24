@@ -45,6 +45,10 @@ class FakeSlotDB:
                 "alive": s.get("alive", True),
                 "heartbeat_ts": self.now,
                 "vram_free_mib": s.get("vram_free_mib", 24000),
+                # RFC 0002: the consumer claim gate requires a GRADUATED slot. Default
+                # 'routable' so existing lease tests (which build live slots) claim as
+                # before; a test can seed 'unverified' to prove the gate excludes it.
+                "status": s.get("status", "routable"),
                 # RFC 0003: epoch is the change-counter; lease_epoch is what the
                 # holder routed against (stamped at claim, cleared at release).
                 "epoch": s.get("epoch", 0),
@@ -83,8 +87,9 @@ class FakeSlotDB:
             self.rows[key] = {
                 "node": node, "endpoint_url": new_url, "slot_id": slot_id,
                 "alive": True, "heartbeat_ts": self.now, "vram_free_mib": 24000,
-                "epoch": epoch, "lease_id": None, "lease_holder": None,
-                "lease_expires": None, "lease_epoch": None, "_heartbeating": True,
+                "status": "routable", "epoch": epoch, "lease_id": None,
+                "lease_holder": None, "lease_expires": None, "lease_epoch": None,
+                "_heartbeating": True,
             }
 
     def close(self):
@@ -128,6 +133,7 @@ class FakeSlotDB:
         if row is None:
             return []
         if not (self._fresh(row)
+                and row["status"] == "routable"  # RFC 0002 Slice-4 quarantine gate
                 and row["vram_free_mib"] >= p["model_mib"]
                 and self._is_free(row)):
             return []

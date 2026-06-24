@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
+import socket
 import subprocess
 import time
 import urllib.error
@@ -24,18 +26,37 @@ import urllib.request
 
 import psycopg
 
-GPU_QUERY = "--query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu"
+# uuid LAST so the existing 5-field parse stays index-stable; it is the MEASURED GPU
+# identity used by the RFC-0002 quarantine ratchet (BC7: a hot-swapped card differs).
+GPU_QUERY = "--query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu,uuid"
 GPU_FORMAT = "--format=csv,noheader,nounits"
+
+# RFC 0002 — quarantine->graduate threshold (Q1). A slot graduates
+# unverified -> probationary -> routable after this many consecutive DB-stamped
+# passing probes (the registration probe counts as the first). Interpolated ONCE into
+# the UPSERT constant at import (a trusted int literal, not user input), so the row-dict
+# passed to conn.execute is unchanged.
+GRADUATION_STREAK = 3
+
+# RFC 0002 Slice 3 — per-node driver-lease TTL (push opt-in). < 45s (the live window),
+# so a dead pusher's lease lapses and the puller resumes within one interval of lapse,
+# before the slot ages out. Evaluated server-side (DB now()), never a node clock.
+NODE_LEASE_TTL = 30
 
 UPSERT = """
 INSERT INTO gpu_slots (
     node, endpoint_url, slot_id, gpu_model, nvlink_domain, vram_total_mib,
     vram_free_mib, gpu_util_pct, loaded_model, served_model, max_context,
-    latency_class, free_slots, epoch, alive, probe_ms, note, heartbeat_ts)
+    latency_class, free_slots, epoch, alive, probe_ms, note,
+    status, probe_streak, gpu_uuid, boot_epoch, heartbeat_ts)
 VALUES (
     %(node)s, %(endpoint)s, %(slot_id)s, %(gpu_model)s, %(nvlink)s, %(vram_total)s,
     %(vram_free)s, %(util)s, %(loaded_model)s, %(served_model)s, %(max_context)s,
-    %(latency_class)s, %(free_slots)s, %(epoch)s, %(alive)s, %(probe_ms)s, %(note)s, now())
+    %(latency_class)s, %(free_slots)s, %(epoch)s, %(alive)s, %(probe_ms)s, %(note)s,
+    -- RFC 0002 Slice-1 Change B: a brand-new self-reporting row appears 'unverified'
+    -- (zero-touch register), with probe_streak seeded 1 on a passing first probe.
+    'unverified', CASE WHEN %(alive)s THEN 1 ELSE 0 END, %(gpu_uuid)s, %(boot_epoch)s,
+    now())
 ON CONFLICT (node, endpoint_url, slot_id) DO UPDATE SET
     gpu_model=EXCLUDED.gpu_model, nvlink_domain=EXCLUDED.nvlink_domain,
     vram_total_mib=EXCLUDED.vram_total_mib, vram_free_mib=EXCLUDED.vram_free_mib,
@@ -52,14 +73,77 @@ ON CONFLICT (node, endpoint_url, slot_id) DO UPDATE SET
     -- (seeding epoch), never an in-place conflict (BC2 handles held leases on a
     -- turned-over endpoint registry-side). A brand-new INSERT still seeds epoch
     -- from %(epoch)s via the VALUES list above; only this conflict path changed.
+    -- RFC 0002 keeps `epoch` BYTE-UNCHANGED (C7): boot_epoch below is a SEPARATE column.
     epoch = gpu_slots.epoch + CASE
         WHEN gpu_slots.served_model   IS DISTINCT FROM EXCLUDED.served_model
           OR gpu_slots.nvlink_domain  IS DISTINCT FROM EXCLUDED.nvlink_domain
           OR gpu_slots.max_context    IS DISTINCT FROM EXCLUDED.max_context
         THEN 1 ELSE 0 END,
+    -- RFC 0002 BC2: a NULL-epoch (pull) writer must NEVER erase a push-stamped
+    -- ratchet, and a NULL (pull) uuid report must NEVER erase a known identity.
+    boot_epoch = COALESCE(EXCLUDED.boot_epoch, gpu_slots.boot_epoch),
+    gpu_uuid   = COALESCE(EXCLUDED.gpu_uuid, gpu_slots.gpu_uuid),
+    -- RFC 0002 BC7 + C10: reset the streak on a failed probe OR a GPU IDENTITY
+    -- CHANGE (both uuids known and different), so a hot-swapped alive card cannot
+    -- inherit the prior streak; trust carries forward only on a matching/unknown uuid.
+    probe_streak = CASE
+        WHEN NOT EXCLUDED.alive THEN 0
+        WHEN gpu_slots.gpu_uuid IS NOT NULL AND EXCLUDED.gpu_uuid IS NOT NULL
+             AND gpu_slots.gpu_uuid <> EXCLUDED.gpu_uuid THEN 1
+        ELSE gpu_slots.probe_streak + 1 END,
+    status = CASE
+        WHEN NOT EXCLUDED.alive THEN 'unverified'
+        WHEN gpu_slots.gpu_uuid IS NOT NULL AND EXCLUDED.gpu_uuid IS NOT NULL
+             AND gpu_slots.gpu_uuid <> EXCLUDED.gpu_uuid THEN 'unverified'
+        WHEN gpu_slots.status = 'routable' THEN 'routable'
+        WHEN gpu_slots.probe_streak + 1 >= {GRADUATION_STREAK} THEN 'routable'
+        ELSE 'probationary' END,
     alive=EXCLUDED.alive, probe_ms=EXCLUDED.probe_ms,
     note=EXCLUDED.note, heartbeat_ts=now()
+-- RFC 0002 BC6 ratchet: a write is admitted iff it carries no boot identity (pull),
+-- the stored row has none yet (pull-only / pre-rollout), or its boot_epoch is STRICTLY
+-- greater. An equal-or-lower replay matches the WHERE as FALSE -> no field moves and
+-- heartbeat_ts is NOT re-stamped. STRICT '>' (never '>=') is what closes the
+-- equal-epoch replay hole; do NOT weaken it.
+WHERE EXCLUDED.boot_epoch IS NULL
+   OR gpu_slots.boot_epoch IS NULL
+   OR EXCLUDED.boot_epoch > gpu_slots.boot_epoch
+""".format(GRADUATION_STREAK=GRADUATION_STREAK)
+
+# RFC 0002 Slice 3 Change A — best-effort per-node driver-lease CAS (push opt-in).
+# A self-pushing node attempts to hold its fleet_nodes lease as a COORDINATION SIGNAL
+# only; the result is IGNORED for the purpose of writing the slot (the UPSERT runs
+# UNCONDITIONALLY — registration = first heartbeat, BC1). For a node absent from
+# fleet_nodes the CAS simply matches zero rows; the node still registers, and the
+# directory-driven puller never probes it, so no contention exists. Freshness is the
+# DB clock (now() >= lease_until), never the pusher's host clock (BC4/C12).
+NODE_LEASE_CAS = """
+UPDATE fleet_nodes
+   SET driven_by = %(me)s, lease_until = now() + make_interval(secs => %(node_ttl)s)
+ WHERE node = %(node)s AND slot_id = %(slot_id)s
+   AND (driven_by IS NULL OR driven_by = %(me)s OR now() >= lease_until)
+RETURNING node
 """
+
+# Strictly-monotonic-per-write boot token (the RFC's Pillar-5 boot_id+seq collapsed to
+# one scalar). Guarded to never regress within a process, so two writes ALWAYS strictly
+# increase -> the ratchet predicate is a STRICT '>'. Across a reboot the wall clock has
+# advanced; across a heartbeat-process restart within one boot the wall clock is global
+# so it still advances. Its ONLY effect is to refuse THIS node's own stale replays; it
+# never decides liveness or gates routing (C12), and a writer can only write its own row.
+_last_epoch = 0
+
+
+def next_boot_epoch() -> int:
+    global _last_epoch
+    _last_epoch = max(_last_epoch + 1, time.time_ns())
+    return _last_epoch
+
+
+def _push_holder() -> str:
+    """Identity a self-pushing node stamps into its per-node driver-lease (observability
+    + CAS self-match). host/pid is enough to distinguish a pusher from the puller."""
+    return f"push/{socket.gethostname()}/{os.getpid()}"
 
 
 def gpu_stats(gpu_cmd: str, timeout: float = 20) -> dict | None:
@@ -72,12 +156,17 @@ def gpu_stats(gpu_cmd: str, timeout: float = 20) -> dict | None:
     line = out.stdout.strip().splitlines()
     if not line:
         return {"_error": "gpu_stats: empty nvidia-smi output"}
-    name, total, used, free, util = (x.strip() for x in line[0].split(","))
+    parts = [x.strip() for x in line[0].split(",")]
+    name, total, used, free, util = parts[:5]
+    # uuid is appended (RFC 0002 measured identity); tolerate an older nvidia-smi /
+    # gpu_cmd that does not emit it (then identity is unknown -> NULL, ratchet inert).
+    uuid = parts[5] if len(parts) > 5 else None
     return {
         "gpu_model": name,
         "vram_total_mib": int(total),
         "vram_free_mib": int(free),
         "gpu_util_pct": int(float(util)) if util not in ("[N/A]", "") else None,
+        "gpu_uuid": uuid or None,
     }
 
 
@@ -256,6 +345,20 @@ def heartbeat_once(conn: psycopg.Connection, args) -> dict:
         served = discover_served_model(args.endpoint, args.served_model)
         alive, probe_ms, probe_err = decode_probe(args.endpoint, served or args.probe_model, args.timeout)
     note = "; ".join(x for x in (gpu_err, probe_err) if x) or None
+    # RFC 0002: only the PUSH / --node-self path stamps a boot_epoch (it has a boot
+    # identity); a pull/proximal-driven write leaves it NULL (an HTTP probe carries no
+    # boot identity, so the puller has nothing truthful to stamp -> ratchet inert).
+    push = getattr(args, "push", False)
+    if push:
+        # Slice 3 Change A: a NON-GATING per-node lease CAS (coordination signal only).
+        # A failure (no fleet_nodes row, pre-migration schema) must NEVER stop the
+        # registering UPSERT, so swallow it and reset the txn before writing the slot.
+        try:
+            conn.execute(NODE_LEASE_CAS, {
+                "me": _push_holder(), "node": args.node,
+                "slot_id": args.slot_id, "node_ttl": NODE_LEASE_TTL})
+        except Exception:
+            conn.rollback()
     row = {
         "node": args.node, "endpoint": args.endpoint, "slot_id": args.slot_id,
         "gpu_model": stats.get("gpu_model"), "nvlink": args.nvlink_domain,
@@ -265,6 +368,8 @@ def heartbeat_once(conn: psycopg.Connection, args) -> dict:
         "served_model": served, "max_context": args.max_context,
         "latency_class": args.latency_class, "free_slots": args.free_slots,
         "epoch": args.epoch, "alive": alive, "probe_ms": probe_ms, "note": note,
+        "gpu_uuid": stats.get("gpu_uuid"),
+        "boot_epoch": next_boot_epoch() if push else None,
     }
     conn.execute(UPSERT, row)
     conn.commit()
@@ -289,6 +394,10 @@ def main() -> int:
                    help="for probe_model=ollama-ondemand: free VRAM needed to call "
                         "the model loadable (default: 23000 or 95%% of total)")
     p.add_argument("--epoch", type=int, default=0)
+    p.add_argument("--push", action="store_true",
+                   help="RFC 0002 push mode (trusted node self-reporting): stamp a "
+                        "monotonic boot_epoch and best-effort hold the per-node "
+                        "driver-lease. Off => pull/proximal-driven write (boot_epoch NULL)")
     p.add_argument("--timeout", type=float, default=30.0)
     p.add_argument("--db", default="dbname=gpu_fleet")
     p.add_argument("--interval", type=float, default=0,

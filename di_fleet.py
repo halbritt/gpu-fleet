@@ -105,10 +105,15 @@ UPDATE gpu_slots
  WHERE (node, endpoint_url, slot_id) = (%(node)s, %(endpoint_url)s, %(slot_id)s)
    AND alive
    AND heartbeat_ts > now() - interval '45 seconds'
+   AND status = 'routable'
    AND vram_free_mib >= %(model_mib)s
    AND (lease_id IS NULL OR now() >= lease_expires)
 RETURNING lease_id
 """
+# RFC 0002 (Slice 4 Change B): a slot is leasable only after it has GRADUATED to
+# status='routable' (RFC-0001's CLAIM inherits the quarantine gate for free — one
+# predicate). renew/release are UNCHANGED: a slot already leased while routable stays
+# renewable through a transient demote within its TTL; demotion gates only NEW claims.
 
 # RENEW — every TTL/3. Zero rows = "lease lost — stop touching the GPU immediately."
 # The now() < lease_expires guard means a lapsed lease cannot be silently resurrected
