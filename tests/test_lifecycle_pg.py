@@ -91,7 +91,8 @@ def _hb_row(*, node=NODE, endpoint=URL, slot_id=SLOT_ID, alive=True, gpu_uuid="U
         "vram_free": vram_free, "util": 5, "loaded_model": served_model if alive else None,
         "served_model": served_model, "max_context": max_context, "latency_class": "batch",
         "free_slots": 1, "epoch": 0, "alive": alive, "probe_ms": probe_ms, "note": note,
-        "gpu_uuid": gpu_uuid, "boot_epoch": boot_epoch,
+        # RFC 0005 (F-KEYS): the shared UPSERT now names mig_mode/ecc_mode.
+        "gpu_uuid": gpu_uuid, "boot_epoch": boot_epoch, "mig_mode": None, "ecc_mode": None,
     }
 
 

@@ -47,7 +47,11 @@ _MIGRATIONS = os.path.join(_ROOT, "migrations")
 # revised UPSERT writes + fleet_meta + routable_slots. Applying them proves they apply
 # cleanly AND that the SQL under test runs against the real schema.
 _FILES = ("001_gpu_slots.sql", "002_fleet_nodes.sql", "007_exclusive_slot_leases.sql",
-          "008_lease_epoch.sql", "009_zero_touch_lifecycle.sql")
+          "008_lease_epoch.sql", "009_zero_touch_lifecycle.sql",
+          # RFC 0005: 010 adds mig_mode/ecc_mode (the revised UPSERT writes them) +
+          # the companion/policy/model tables + capacity_slots view. Applying it proves
+          # 010 lands cleanly on the real schema the UPSERT now targets.
+          "010_exporter_capacity_signal.sql")
 
 NODE, URL, SLOT_ID = "t", "http://t:8081/v1", 0
 SLOT = {"node": NODE, "endpoint_url": URL, "slot_id": SLOT_ID}
@@ -78,7 +82,10 @@ def _hb_row(**over):
         # RFC 0002 columns the revised UPSERT writes; pull-style defaults (boot_epoch
         # NULL => ratchet inert, gpu_uuid NULL => identity unknown) keep these epoch
         # tests focused on `epoch`, not the quarantine ratchet.
-        "gpu_uuid": None, "boot_epoch": None,
+        # RFC 0005: mig_mode/ecc_mode default NULL => the new epoch-CASE terms are inert
+        # (NULL IS DISTINCT FROM NULL is false), so these tests stay focused on the
+        # served_model/nvlink/max_context bumps unless a test sets them explicitly.
+        "gpu_uuid": None, "boot_epoch": None, "mig_mode": None, "ecc_mode": None,
     }
     row.update(over)
     return row

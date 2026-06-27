@@ -268,6 +268,8 @@ def test_upsert_stamps_heartbeat_ts_from_db_clock(monkeypatch):
         free_slots=1, min_load_vram_mib=None, epoch=0, timeout=5.0, push=False)
     conn = _RecordingConn()
     heartbeat.heartbeat_once(conn, args)
-    sql, row = conn.calls[-1]
-    assert sql == heartbeat.UPSERT
+    # RFC 0005: heartbeat_once now also issues the savepoint-guarded CAPACITY_UPSERT AFTER
+    # the liveness UPSERT, so the liveness UPSERT is no longer conn.calls[-1] — locate it.
+    sql, row = next((c for c in conn.calls if c[0] == heartbeat.UPSERT), (None, None))
+    assert sql == heartbeat.UPSERT, "heartbeat_once must still issue the liveness UPSERT"
     assert "heartbeat_ts" not in row, "the node must not supply heartbeat_ts"

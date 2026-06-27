@@ -96,6 +96,15 @@ RENEW_SECONDS = 15  # TTL/3
 # capability this holder routed against. The renew fence (below) then self-compares
 # `epoch = lease_epoch` column-to-column, so the consumer carries NO epoch state and
 # `claim()`'s Python signature is unchanged.
+# RFC 0005 (Slice 3, BC1): the claim gate is the SAME request-aware, freshness-decayed
+# HEADROOM predicate as PICK, but expressed with CORRELATED SCALAR SUBQUERIES because an
+# UPDATE ... WHERE cannot add a FROM. The fresh effective_free (decayed to NULL once stale,
+# BC2 single-clock) COALESCEs through to vram_free_mib; the requirement adds the per-slot
+# model footprint + the max_context-derived KV budget (kv_bytes = the DEFINED inline
+# expression CEIL(kv_mib_per_1k_tokens * max_context / 1000)::int). `model_mib` is KEPT as
+# an additive floor term (defaulted 0) so the existing claim(model_mib=…) signature is
+# untouched and byte-equivalent when unset, and with max_context NULL + no model_capacity
+# row the predicate reduces to today's `vram_free_mib >= %(model_mib)s` (C7).
 LEASE_CLAIM_SQL = """
 UPDATE gpu_slots
    SET lease_id      = gen_random_uuid(),
@@ -106,7 +115,23 @@ UPDATE gpu_slots
    AND alive
    AND heartbeat_ts > now() - interval '45 seconds'
    AND status = 'routable'
-   AND vram_free_mib >= %(model_mib)s
+   AND COALESCE(
+         (SELECT CASE WHEN c.capacity_source = 'measured'
+                        AND (COALESCE(c.fast_source_age_s, 0)
+                               + GREATEST(0, EXTRACT(EPOCH FROM (now() - c.updated_ts))))
+                            <= cp.decay_k * cp.fast_half_life_s
+                      THEN c.effective_free_mib ELSE NULL END
+            FROM gpu_slots_capacity c
+            CROSS JOIN (SELECT decay_k, fast_half_life_s FROM capacity_policy WHERE id = 1) cp
+           WHERE (c.node, c.endpoint_url, c.slot_id)
+               = (gpu_slots.node, gpu_slots.endpoint_url, gpu_slots.slot_id)),
+         gpu_slots.vram_free_mib)
+       >= COALESCE(%(model_mib)s, 0)
+        + COALESCE((SELECT footprint_mib FROM model_capacity
+                     WHERE model = gpu_slots.served_model), 0)
+        + CEIL(COALESCE((SELECT kv_mib_per_1k_tokens FROM model_capacity
+                          WHERE model = gpu_slots.served_model), 0)
+               * COALESCE(%(max_context)s, 0)::numeric / 1000.0)::int
    AND (lease_id IS NULL OR now() >= lease_expires)
 RETURNING lease_id
 """
@@ -160,10 +185,13 @@ UPDATE gpu_slots
 """
 
 
-def claim(conn, slot, holder, *, ttl_seconds=TTL_SECONDS, model_mib=0):
+def claim(conn, slot, holder, *, ttl_seconds=TTL_SECONDS, model_mib=0, max_context=None):
     """Atomically claim `slot` for `holder` for `ttl_seconds`. Returns the new
     lease_id, or None if the slot was not claimable (held, stale, load-starved, or
-    gone). `slot` is a dict carrying at least node / endpoint_url / slot_id."""
+    OVER its request-aware headroom). `slot` is a dict carrying at least node /
+    endpoint_url / slot_id. `max_context` (BC1) threads the request context length into
+    the headroom predicate so a 32k vs a 4k request can route to different slots; it is
+    the SAME non-default scalar production threads through pick + first-claim + failover."""
     row = conn.execute(
         LEASE_CLAIM_SQL,
         {
@@ -173,6 +201,7 @@ def claim(conn, slot, holder, *, ttl_seconds=TTL_SECONDS, model_mib=0):
             "endpoint_url": slot["endpoint_url"],
             "slot_id": slot.get("slot_id", 0),
             "model_mib": model_mib or 0,
+            "max_context": max_context,
         },
     ).fetchone()
     return row[0] if row else None
@@ -195,7 +224,7 @@ def release(conn, lease_id):
 
 
 def failover_transfer(conn, dead_lease_id, candidate_slots, holder,
-                      *, ttl_seconds=TTL_SECONDS, model_mib=0):
+                      *, ttl_seconds=TTL_SECONDS, model_mib=0, max_context=None):
     """RFC 0001 failover = atomic transfer, not return-to-pool.
 
     In ONE transaction (the caller commits/rolls back), RELEASE the dead shard's
@@ -212,8 +241,8 @@ def failover_transfer(conn, dead_lease_id, candidate_slots, holder,
     transaction: pass a non-autocommit conn and commit once on a non-None result."""
     release(conn, dead_lease_id)
     for slot in candidate_slots:
-        lease_id = claim(conn, slot, holder,
-                         ttl_seconds=ttl_seconds, model_mib=model_mib)
+        lease_id = claim(conn, slot, holder, ttl_seconds=ttl_seconds,
+                         model_mib=model_mib, max_context=max_context)
         if lease_id is not None:
             return {"slot": slot, "lease_id": lease_id}
     return None
@@ -235,7 +264,8 @@ leases = _Leases()
 # --------------------------------------------------------------------------- #
 # Routing: which live http LLM slots to spread across.
 # --------------------------------------------------------------------------- #
-def route_slots(k, db="dbname=gpu_fleet", latency_class=None, pick_fn=None):
+def route_slots(k, db="dbname=gpu_fleet", latency_class=None, pick_fn=None,
+                max_context=None):
     """Up to `k` live http(s) LLM slots, warm-first. di needs an OpenAI-compatible
     HTTP endpoint, never a non-LLM capability (marker's ssh://), so we filter to
     http(s); and we prefer decode-verified WARM slots (real `probe_ms`) over
@@ -260,13 +290,17 @@ def route_slots(k, db="dbname=gpu_fleet", latency_class=None, pick_fn=None):
     default), never an exception."""
     fetch_k = max(k + 8, 16)  # margin so non-LLM rows can't crowd out real LLM slots
     if pick_fn is None:
-        def pick_fn(n):
+        def pick_fn(n, max_context=None):
             import pick_slot  # local module; only http(s) rows are LLMs
             import psycopg
             with psycopg.connect(db) as conn:
-                return pick_slot.pick(conn, latency_class=latency_class, k=n)
+                return pick_slot.pick(conn, latency_class=latency_class, k=n,
+                                      max_context=max_context)
+    # BC1: thread the request max_context into pick so route_slots/pick see the SAME
+    # non-default scalar the first-attempt claim + failover claim do (a defaulted kwarg
+    # production never populates would NOT satisfy the gate).
     try:
-        picks = pick_fn(fetch_k)
+        picks = pick_fn(fetch_k, max_context=max_context)
     except Exception as exc:  # no DB, no psycopg, query error -> degrade to di default
         print(f"di-fleet: registry unreachable ({exc}); using di default", file=sys.stderr)
         return []
@@ -490,6 +524,7 @@ def _run_and_settle(conn, slot, lease_id, frames, flags, *, holder, lease_ops,
 
 def run_leased_shard(slot, frames, flags, *, holder, conn_factory,
                      lease_ops=leases, child_factory=_popen_child, model_mib=0,
+                     max_context=None,
                      ttl_seconds=TTL_SECONDS, renew_seconds=RENEW_SECONDS,
                      timeout=SHARD_TIMEOUT, sleep=time.sleep, clock=time.monotonic):
     """First-attempt shard: claim `slot`'s lease, run ONE `di --json` child against it
@@ -506,8 +541,8 @@ def run_leased_shard(slot, frames, flags, *, holder, conn_factory,
     release-now, claim-later sequence that would expose the freed slot to the open
     pool."""
     conn = conn_factory()
-    lease_id = lease_ops.claim(conn, slot, holder,
-                               ttl_seconds=ttl_seconds, model_mib=model_mib)
+    lease_id = lease_ops.claim(conn, slot, holder, ttl_seconds=ttl_seconds,
+                               model_mib=model_mib, max_context=max_context)
     if lease_id is None:
         _close(conn)
         raise LeaseLost(f"could not claim a lease on {slot.get('endpoint_url')}")
@@ -523,7 +558,7 @@ def run_leased_shard(slot, frames, flags, *, holder, conn_factory,
 
 def run_failover_shard(dead_lease_id, survivor_slot, frames, flags, *, holder,
                        conn_factory, transfer_conn_factory, lease_ops=leases,
-                       child_factory=_popen_child, model_mib=0,
+                       child_factory=_popen_child, model_mib=0, max_context=None,
                        ttl_seconds=TTL_SECONDS, renew_seconds=RENEW_SECONDS,
                        timeout=SHARD_TIMEOUT, sleep=time.sleep, clock=time.monotonic):
     """RFC 0001 failover = ATOMIC transfer, not return-to-pool (BC4). In ONE Postgres
@@ -544,7 +579,7 @@ def run_failover_shard(dead_lease_id, survivor_slot, frames, flags, *, holder,
         candidates = [survivor_slot] if survivor_slot else []
         transferred = lease_ops.failover_transfer(
             tconn, dead_lease_id, candidates, holder,
-            ttl_seconds=ttl_seconds, model_mib=model_mib)
+            ttl_seconds=ttl_seconds, model_mib=model_mib, max_context=max_context)
         _commit(tconn)
     except BaseException:
         _rollback(tconn)
@@ -845,10 +880,16 @@ def render_summary(merged):
 # else (problem text, --ideas, --context, --concurrency, --no-code-mode, --model)
 # passes straight through to each shard.
 def _split_argv(argv):
-    """Pull out di-fleet-owned flags (--frames, --top, --json) and the K override;
-    return (frames, top, want_json, k, passthrough_flags). The problem text and
-    every other di flag stay in passthrough verbatim."""
-    frames, top, want_json, k = None, None, False, None
+    """Pull out di-fleet-owned flags (--frames, --top, --json), the K override, and the
+    request --max-context (BC1); return (frames, top, want_json, k, max_context,
+    passthrough_flags). The problem text and every other di flag stay in passthrough
+    verbatim. --max-context is di-fleet-OWNED (consumed; it shapes routing, not the child),
+    while --model is PEEKED — its value is read for completeness but LEFT in passthrough so
+    the child still receives it (per-slot footprint/KV come from model_capacity joined on
+    the slot's served_model in SQL, so the only scalar threaded through Python is
+    max_context). This is argv parsing only — the `di --json` boundary is preserved; the
+    engine is never imported."""
+    frames, top, want_json, k, max_context = None, None, False, None, None
     rest = []
     i = 0
     while i < len(argv):
@@ -863,9 +904,14 @@ def _split_argv(argv):
             want_json = True; i += 1
         elif a == "-k" or a == "--slots":
             k = int(argv[i + 1]); i += 2  # di-fleet-only: fan-out width override
+        elif a == "--max-context":
+            max_context = int(argv[i + 1]); i += 2  # di-fleet-owned: request headroom (BC1)
+        elif a == "--model":
+            rest += [a, argv[i + 1]]  # PEEK: child still gets --model; not threaded
+            i += 2
         else:
             rest.append(a); i += 1
-    return frames, top, want_json, k, rest
+    return frames, top, want_json, k, max_context, rest
 
 
 def _holder_id():
@@ -895,14 +941,35 @@ def _pg_transfer_conn_factory(db):
     return factory
 
 
+def _resolve_max_context(flag, db):
+    """BC1: the request max_context is the --max-context flag if given, else the registry
+    default capacity_policy.default_request_context_tokens (a SINGLE read of the singleton
+    row). argv + registry SQL only — the engine is never imported and no GPU is read. Any
+    failure (no DB, unseeded) degrades to None => 0 KV => today's flat-VRAM predicate."""
+    if flag is not None:
+        return flag
+    try:
+        import psycopg
+        with psycopg.connect(db) as conn:
+            row = conn.execute(
+                "SELECT default_request_context_tokens FROM capacity_policy WHERE id = 1"
+            ).fetchone()
+        return row[0] if row and row[0] else None
+    except Exception:
+        return None
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
-    frames, top, want_json, k_override, passthrough = _split_argv(argv)
+    frames, top, want_json, k_override, max_context_flag, passthrough = _split_argv(argv)
     total_frames = frames if frames is not None else 5  # di's --frames default
 
     db = os.environ.get("GPU_FLEET_DB", "dbname=gpu_fleet")
     k = k_override or total_frames  # never route more slots than there are frames
-    slots = route_slots(k, db=db)
+    # BC1: compute the request capacity ONCE and thread the SAME non-default scalar through
+    # ALL THREE claim paths (route_slots/pick, first-attempt claim, failover claim).
+    max_context = _resolve_max_context(max_context_flag, db)
+    slots = route_slots(k, db=db, max_context=max_context)
 
     # No live fleet slot -> single di on its own localhost default (today's
     # behavior). Nothing to lease, so we exec and pass frames through unchanged.
@@ -928,14 +995,17 @@ def main(argv=None):
 
     def leased_shard(endpoint, frames, flags):
         return run_leased_shard(endpoint, frames, flags,
-                                holder=holder, conn_factory=conn_factory)
+                                holder=holder, conn_factory=conn_factory,
+                                max_context=max_context)
 
     def leased_failover(dead_lease_id, survivor, frames, flags):
         # RFC 0001 failover transfer: release the dead lease + claim the survivor in
         # ONE transaction (BC4), then run the retry child under the transferred lease.
+        # BC1: the same request max_context threads into the failover claim too.
         return run_failover_shard(dead_lease_id, survivor, frames, flags,
                                   holder=holder, conn_factory=conn_factory,
-                                  transfer_conn_factory=transfer_conn_factory)
+                                  transfer_conn_factory=transfer_conn_factory,
+                                  max_context=max_context)
 
     results, lost = dispatch(slots, total_frames, passthrough,
                              shard_fn=leased_shard, failover_fn=leased_failover)

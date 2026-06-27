@@ -236,7 +236,7 @@ def test_route_slots_not_starved_by_non_llm_rows_when_k_is_small():
     ]
     seen = {}
 
-    def fake_pick(fetch_k):
+    def fake_pick(fetch_k, max_context=None):
         seen["fetch_k"] = fetch_k
         return rows
 
@@ -251,7 +251,7 @@ def test_route_slots_trims_to_k_after_filtering():
     # More live LLM slots than k -> trim to exactly k (warm-first preserved).
     rows = [{"endpoint_url": f"http://n{i}:8081/v1", "served_model": "m",
              "probe_ms": (1.0 if i == 0 else None)} for i in range(5)]
-    out = df.route_slots(3, pick_fn=lambda n: rows)
+    out = df.route_slots(3, pick_fn=lambda n, max_context=None: rows)
     assert len(out) == 3
     assert out[0]["endpoint_url"] == "http://n0:8081/v1"   # the warm one leads
 
@@ -346,7 +346,7 @@ def test_failed_renew_aborts_shard():
         def __init__(self):
             self.released = []
 
-        def claim(self, conn, slot, holder, *, ttl_seconds=45, model_mib=0):
+        def claim(self, conn, slot, holder, *, ttl_seconds=45, model_mib=0, max_context=None):
             return "L1"
 
         def renew(self, conn, lease_id, *, ttl_seconds=45):
@@ -393,7 +393,7 @@ def test_release_called_on_completion_and_no_renew_after():
             self.released = None
             self.renews = 0
 
-        def claim(self, conn, slot, holder, *, ttl_seconds=45, model_mib=0):
+        def claim(self, conn, slot, holder, *, ttl_seconds=45, model_mib=0, max_context=None):
             return "L1"
 
         def renew(self, conn, lease_id, *, ttl_seconds=45):
@@ -539,3 +539,120 @@ def test_dispatch_failover_routes_through_atomic_transfer_not_release_then_claim
     dead_slot = next(s for s in slots if s["endpoint_url"] == dead_url)
     assert db.row_for(dead_slot)["lease_id"] is None  # freed via the transfer
     assert all(r["lease_id"] is None for r in db.rows.values())
+
+
+# =========================================================================== #
+# RFC 0005 gate bullet 8 (BC1) — the request-capacity contract IN PRODUCTION.
+#
+# The same non-default max_context must thread through route_slots/pick, the first-attempt
+# claim, AND the failover claim (a defaulted kwarg production never populates would NOT
+# satisfy the gate), and a 32k request must route DIFFERENTLY than a 4k one against the
+# SAME slot whose effective_free sits between the two headroom thresholds. Hermetic: a
+# recording pick_fn + a HeadroomOps fake that models the SQL headroom predicate.
+# =========================================================================== #
+class HeadroomOps:
+    """Models the request-aware headroom claim gate: a slot with `effective_free` MiB is
+    claimable iff effective_free >= footprint + CEIL(kv_per_1k * max_context / 1000). Records
+    the max_context every claim / failover_transfer received (the threading proof)."""
+
+    def __init__(self, effective_free, footprint, kv_per_1k):
+        self.E, self.F, self.K = effective_free, footprint, kv_per_1k
+        self.claim_ctx = []
+        self.transfer_ctx = []
+        self._seq = 0
+
+    def _fits(self, max_context):
+        import math
+        need = self.F + math.ceil(self.K * (max_context or 0) / 1000)
+        return self.E >= need
+
+    def claim(self, conn, slot, holder, *, ttl_seconds=45, model_mib=0, max_context=None):
+        self.claim_ctx.append(max_context)
+        if not self._fits(max_context):
+            return None
+        self._seq += 1
+        return f"L{self._seq}"
+
+    def renew(self, conn, lease_id, *, ttl_seconds=45):
+        return True
+
+    def release(self, conn, lease_id):
+        pass
+
+    def failover_transfer(self, conn, dead_lease_id, candidates, holder, *,
+                          ttl_seconds=45, model_mib=0, max_context=None):
+        self.transfer_ctx.append(max_context)
+        for slot in candidates:
+            lid = self.claim(conn, slot, holder, ttl_seconds=ttl_seconds,
+                             model_mib=model_mib, max_context=max_context)
+            if lid is not None:
+                return {"slot": slot, "lease_id": lid}
+        return None
+
+
+def test_request_context_threads_through_all_claim_paths():
+    slot = {"node": "n", "endpoint_url": "http://n0:8081/v1", "slot_id": 0,
+            "served_model": "m", "probe_ms": 1.0}
+    # footprint 1000, kv 500 MiB/1k tokens: 4k need = 1000 + 2048 = 3048; 32k need = 17384.
+    # effective_free 8000 sits BETWEEN -> 4k fits, 32k does not, on the SAME slot.
+    def ops():
+        return HeadroomOps(effective_free=8000, footprint=1000, kv_per_1k=500)
+
+    # (i) route_slots/pick receives the request max_context.
+    seen = {}
+
+    def rec_pick(fetch_k, max_context=None):
+        seen["max_context"] = max_context
+        return [slot]
+
+    routed = df.route_slots(1, pick_fn=rec_pick, max_context=4096)
+    assert seen["max_context"] == 4096, "route_slots must thread max_context to pick"
+    assert routed and routed[0]["endpoint_url"] == slot["endpoint_url"]
+
+    # (ii) the FIRST-ATTEMPT claim receives the same non-default max_context; 4k claims it.
+    ops4 = ops()
+    res = df.run_leased_shard(
+        slot, 5, [], holder="A", conn_factory=lambda: None, lease_ops=ops4,
+        child_factory=lambda *a: FakeChild(returncode=0, stdout=_di_json(slot["endpoint_url"])),
+        sleep=lambda _s: None, max_context=4096)
+    assert ops4.claim_ctx == [4096], "first-attempt claim must receive the request max_context"
+    assert res["problem"] == "p"                          # 4k REQUEST CLAIMED the slot
+
+    # (iii) the SAME slot REFUSES a 32k request (headroom exceeded) -> LeaseLost.
+    ops32 = ops()
+    with pytest.raises(df.LeaseLost):
+        df.run_leased_shard(
+            slot, 5, [], holder="A", conn_factory=lambda: None, lease_ops=ops32,
+            child_factory=lambda *a: FakeChild(runs_forever=True),
+            sleep=lambda _s: None, max_context=32768)
+    assert ops32.claim_ctx == [32768]                     # 32k threaded, but routed differently
+
+    # (iv) the FAILOVER claim also receives the same non-default max_context.
+    opsf = ops()
+    resf = df.run_failover_shard(
+        "DEAD", slot, 5, [], holder="A", conn_factory=lambda: None,
+        transfer_conn_factory=lambda: None, lease_ops=opsf,
+        child_factory=lambda *a: FakeChild(returncode=0, stdout=_di_json(slot["endpoint_url"])),
+        sleep=lambda _s: None, max_context=4096)
+    assert opsf.transfer_ctx == [4096], "failover_transfer must receive the request max_context"
+    assert opsf.claim_ctx == [4096]                       # and its inner claim too
+    assert resf["problem"] == "p"
+
+
+def test_no_engine_import_in_reader():
+    # N3 (boundary): di_fleet / pick_slot import NEITHER the Node DI engine NOR a GPU library;
+    # request capacity comes ONLY from argv (--max-context) + a registry read (capacity_policy).
+    import inspect
+    import importlib
+    for modname in ("di_fleet", "pick_slot"):
+        src = inspect.getsource(importlib.import_module(modname))
+        for forbidden in ("import torch", "import pynvml", "from pynvml",
+                          "import nvidia", "import divergent", "from divergent",
+                          "require('", "node:engine"):
+            assert forbidden not in src, f"{modname} must not import the engine/GPU ({forbidden})"
+    # request capacity is argv + registry SQL only.
+    assert "--max-context" in inspect.getsource(df._split_argv)
+    assert "capacity_policy" in inspect.getsource(df._resolve_max_context)
+    # the di boundary stays a SUBPROCESS (the child is launched via node, never imported).
+    assert "subprocess" in inspect.getsource(df)
+    assert "node" in inspect.getsource(df._popen_child)
