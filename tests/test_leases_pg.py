@@ -43,6 +43,9 @@ CREATE TABLE gpu_slots (
     endpoint_url  TEXT NOT NULL,
     slot_id       INT  NOT NULL DEFAULT 0,
     vram_free_mib INT,
+    -- RFC 0005: the request-aware LEASE_CLAIM_SQL correlates model_capacity on the slot's
+    -- served_model, so this temp DDL must carry the column or the lease PG suite would error.
+    served_model  TEXT,
     capacity      INT  NOT NULL DEFAULT 1 CHECK (capacity >= 1),
     lease_id      UUID,
     lease_holder  TEXT,
@@ -60,6 +63,26 @@ CREATE TABLE gpu_slots (
     alive         BOOLEAN NOT NULL DEFAULT true,
     heartbeat_ts  TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (node, endpoint_url, slot_id)
+);
+-- RFC 0005: the request-aware LEASE_CLAIM_SQL also correlates the companion + the singleton
+-- policy + model_capacity. They are EMPTY here, so the predicate degrades to today's flat
+-- VRAM test (effective_free NULL -> COALESCE(vram_free); footprint/KV -> 0) and these lease
+-- tests behave exactly as before. Minimal subset of migration 010 (the view is unused here).
+CREATE TABLE IF NOT EXISTS gpu_slots_capacity (
+    node TEXT NOT NULL, endpoint_url TEXT NOT NULL, slot_id INT NOT NULL DEFAULT 0,
+    effective_free_mib INT, capacity_source TEXT, fast_source_age_s NUMERIC,
+    updated_ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (node, endpoint_url, slot_id)
+);
+CREATE TABLE IF NOT EXISTS capacity_policy (
+    id INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    fast_half_life_s NUMERIC NOT NULL DEFAULT 30, decay_k NUMERIC NOT NULL DEFAULT 3,
+    default_request_context_tokens INT NOT NULL DEFAULT 0
+);
+INSERT INTO capacity_policy (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
+CREATE TABLE IF NOT EXISTS model_capacity (
+    model TEXT PRIMARY KEY, footprint_mib INT NOT NULL DEFAULT 0,
+    kv_mib_per_1k_tokens NUMERIC NOT NULL DEFAULT 0
 );
 """
 

@@ -25,12 +25,15 @@ class RecordingConn:
         return list(self._rows)
 
 
-# A row tuple in PICK's exact column order (pick_slot.COLS).
+# A row tuple in PICK's exact column order (pick_slot.COLS). RFC 0005 appended three
+# additive trailing columns (effective_free_mib, capacity_source, degraded).
 def _row(node="proximal", url="http://proximal:8081/v1", slot_id=0, model="m",
          lclass="interactive", vram=24000, capacity=1, nvlink=None, probe=12,
-         lease_id=None, lease_expires=None, epoch=0):
+         lease_id=None, lease_expires=None, epoch=0,
+         effective_free_mib=None, capacity_source="measured", degraded=False):
     return (node, url, slot_id, model, lclass, vram, capacity, nvlink, probe,
-            lease_id, lease_expires, epoch)
+            lease_id, lease_expires, epoch,
+            effective_free_mib, capacity_source, degraded)
 
 
 # --------------------------------------------------------------------------- #
@@ -102,3 +105,54 @@ def test_pick_surfaces_current_epoch_and_model():
     assert "epoch" in sql                       # epoch is in the PICK SELECT
     assert out[0]["epoch"] == 7                  # surfaced verbatim from the row
     assert out[0]["served_model"] == "mistral-new"
+
+
+# --------------------------------------------------------------------------- #
+# RFC 0005 gate bullet 5 (C5) — pick degrades to last-known-good, never empty.
+# --------------------------------------------------------------------------- #
+def test_pick_degrades_not_empty_when_all_stale():
+    # "J" — every returned slot has decayed to stale capacity (the SQL COALESCEs the headroom
+    # through to vram_free_mib so a stale slot is NOT dropped). pick() returns them flagged
+    # degraded=True, never []. The dead-man guard keeps the router from emptying on a skew
+    # event / exporter outage.
+    conn = RecordingConn([_row(capacity_source="stale", degraded=True),
+                          _row(slot_id=1, capacity_source="stale", degraded=True)])
+    out = pick_slot.pick(conn)
+    assert out != [], "pick must degrade to last-known-good, not return empty"
+    assert all(s["degraded"] for s in out)
+    assert {s["capacity_source"] for s in out} == {"stale"}
+
+
+# --------------------------------------------------------------------------- #
+# RFC 0005 gate bullet 5b (F-LOCK) — pick locks the BASE table, never a join view.
+# --------------------------------------------------------------------------- #
+def test_pick_locks_base_table_not_view():
+    # "P1" — PICK selects FROM gpu_slots (the base relation) and ends FOR UPDATE OF gpu_slots
+    # SKIP LOCKED, so Postgres locks exactly the gpu_slots row and never tries to lock the
+    # read-only companion/policy/model joins (which would error on a non-lockable join/view).
+    conn = RecordingConn([_row()])
+    pick_slot.pick(conn)
+    sql, _ = conn.calls[0]
+    assert "FROM gpu_slots" in sql
+    assert "FOR UPDATE OF gpu_slots SKIP LOCKED" in sql
+    assert "FROM capacity_slots" not in sql, "must never lock through the read-only view"
+    assert "FOR UPDATE SKIP LOCKED" not in sql, "the lock clause must name OF gpu_slots"
+    # the policy join is the SINGLETON (F-CARD: cannot multiply a slot row).
+    assert "FROM capacity_policy WHERE id = 1" in sql
+
+
+# --------------------------------------------------------------------------- #
+# RFC 0005 gate bullet 8 (BC1) — request-aware headroom is threaded into the query.
+# --------------------------------------------------------------------------- #
+def test_pick_threads_max_context_into_request_aware_headroom():
+    conn = RecordingConn([_row()])
+    pick_slot.pick(conn, max_context=32768, min_vram=100)
+    sql, params = conn.calls[0]
+    assert params["max_context"] == 32768               # threaded verbatim into the SQL
+    assert "footprint_mib" in sql                        # per-slot model footprint (model_capacity)
+    assert "kv_mib_per_1k_tokens" in sql                 # per-token KV cost
+    assert "CEIL(" in sql                                # kv_bytes = the DEFINED inline expression
+    # with max_context absent the predicate is byte-equivalent to today's flat VRAM test.
+    conn2 = RecordingConn([_row()])
+    pick_slot.pick(conn2)
+    assert conn2.calls[0][1]["max_context"] is None

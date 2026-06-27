@@ -26,9 +26,14 @@ import urllib.request
 
 import psycopg
 
-# uuid LAST so the existing 5-field parse stays index-stable; it is the MEASURED GPU
+# uuid stays at index 5 so the existing parse is index-stable; it is the MEASURED GPU
 # identity used by the RFC-0002 quarantine ratchet (BC7: a hot-swapped card differs).
-GPU_QUERY = "--query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu,uuid"
+# RFC 0005 (Slice 2, F-KEYS): mig.mode.current / ecc.mode.current are appended AFTER uuid
+# (indices 6,7) — the SLOW capability bands that bump epoch (C-EPOCH). An older nvidia-smi
+# that omits them yields fewer fields => mig/ecc parse to None (ratchet inert), exactly as
+# uuid is already tolerated.
+GPU_QUERY = ("--query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu,uuid,"
+             "mig.mode.current,ecc.mode.current")
 GPU_FORMAT = "--format=csv,noheader,nounits"
 
 # RFC 0002 — quarantine->graduate threshold (Q1). A slot graduates
@@ -48,15 +53,17 @@ INSERT INTO gpu_slots (
     node, endpoint_url, slot_id, gpu_model, nvlink_domain, vram_total_mib,
     vram_free_mib, gpu_util_pct, loaded_model, served_model, max_context,
     latency_class, free_slots, epoch, alive, probe_ms, note,
-    status, probe_streak, gpu_uuid, boot_epoch, heartbeat_ts)
+    status, probe_streak, gpu_uuid, boot_epoch, mig_mode, ecc_mode, heartbeat_ts)
 VALUES (
     %(node)s, %(endpoint)s, %(slot_id)s, %(gpu_model)s, %(nvlink)s, %(vram_total)s,
     %(vram_free)s, %(util)s, %(loaded_model)s, %(served_model)s, %(max_context)s,
     %(latency_class)s, %(free_slots)s, %(epoch)s, %(alive)s, %(probe_ms)s, %(note)s,
     -- RFC 0002 Slice-1 Change B: a brand-new self-reporting row appears 'unverified'
     -- (zero-touch register), with probe_streak seeded 1 on a passing first probe.
+    -- RFC 0005 (F-KEYS): mig_mode/ecc_mode are named in EVERY writer's row dict so the
+    -- shared UPSERT never KeyErrors a writer (heartbeat_once, probe_node, _failed_row).
     'unverified', CASE WHEN %(alive)s THEN 1 ELSE 0 END, %(gpu_uuid)s, %(boot_epoch)s,
-    now())
+    %(mig_mode)s, %(ecc_mode)s, now())
 ON CONFLICT (node, endpoint_url, slot_id) DO UPDATE SET
     gpu_model=EXCLUDED.gpu_model, nvlink_domain=EXCLUDED.nvlink_domain,
     vram_total_mib=EXCLUDED.vram_total_mib, vram_free_mib=EXCLUDED.vram_free_mib,
@@ -74,10 +81,19 @@ ON CONFLICT (node, endpoint_url, slot_id) DO UPDATE SET
     -- turned-over endpoint registry-side). A brand-new INSERT still seeds epoch
     -- from %(epoch)s via the VALUES list above; only this conflict path changed.
     -- RFC 0002 keeps `epoch` BYTE-UNCHANGED (C7): boot_epoch below is a SEPARATE column.
+    -- RFC 0005 C-EPOCH: extend the routing-relevant diff with the SLOW CAPABILITY bands
+    -- mig_mode/ecc_mode (the card's compute partitioning changed => a holder's routing
+    -- assumption is invalidated => fence held leases). These come from the node's OWN
+    -- local nvidia-smi (measured, trusted), NOT the exporter, so epoch stays decoupled
+    -- from the untrusted exporter. The FAST capacity bands (probe-floor/util/contention/
+    -- phantom) live ONLY in the companion table and never appear here, so within-band
+    -- VRAM/util churn never bumps epoch or self-aborts a running job.
     epoch = gpu_slots.epoch + CASE
         WHEN gpu_slots.served_model   IS DISTINCT FROM EXCLUDED.served_model
           OR gpu_slots.nvlink_domain  IS DISTINCT FROM EXCLUDED.nvlink_domain
           OR gpu_slots.max_context    IS DISTINCT FROM EXCLUDED.max_context
+          OR gpu_slots.mig_mode       IS DISTINCT FROM EXCLUDED.mig_mode
+          OR gpu_slots.ecc_mode       IS DISTINCT FROM EXCLUDED.ecc_mode
         THEN 1 ELSE 0 END,
     -- RFC 0002 BC2: a NULL-epoch (pull) writer must NEVER erase a push-stamped
     -- ratchet, and a NULL (pull) uuid report must NEVER erase a known identity.
@@ -99,6 +115,10 @@ ON CONFLICT (node, endpoint_url, slot_id) DO UPDATE SET
         WHEN gpu_slots.probe_streak + 1 >= {GRADUATION_STREAK} THEN 'routable'
         ELSE 'probationary' END,
     alive=EXCLUDED.alive, probe_ms=EXCLUDED.probe_ms,
+    -- RFC 0005: persist the measured slow capability bands (their change drove the epoch
+    -- CASE above). COALESCE-free: a NULL report (older nvidia-smi) overwrites with NULL,
+    -- and NULL IS DISTINCT FROM NULL is false, so it never spuriously bumps epoch.
+    mig_mode=EXCLUDED.mig_mode, ecc_mode=EXCLUDED.ecc_mode,
     note=EXCLUDED.note, heartbeat_ts=now()
 -- RFC 0002 BC6 ratchet: a write is admitted iff it carries no boot identity (pull),
 -- the stored row has none yet (pull-only / pre-rollout), or its boot_epoch is STRICTLY
@@ -109,6 +129,219 @@ WHERE EXCLUDED.boot_epoch IS NULL
    OR gpu_slots.boot_epoch IS NULL
    OR EXCLUDED.boot_epoch > gpu_slots.boot_epoch
 """.format(GRADUATION_STREAK=GRADUATION_STREAK)
+
+
+# =========================================================================== #
+# RFC 0005 — exporter-fed capacity signal (probe-anchored). The companion table
+# gpu_slots_capacity is written by a SEPARATE, savepoint-guarded statement AFTER the
+# liveness UPSERT (C3 fault isolation), in BOTH the push (heartbeat_once) and pull
+# (heartbeat_all.pull_write) paths (BC4). Every routing-relevant number is
+# probe-anchored, banded for hysteresis, and carries single-clock freshness (BC2).
+# =========================================================================== #
+
+# Hysteresis band widths. The authoritative tuning lives in capacity_policy (band edges
+# AS DATA), read by the freshness-decaying VIEW / inline pick; the writer mirrors the
+# defaults here so a within-band tick writes an IDENTICAL companion row (a no-op) without
+# a per-tick policy SELECT. Keep in lockstep with capacity_policy's defaults.
+VRAM_BAND_MIB = 1000
+UTIL_BAND_PCT = 10
+
+
+def _band_mib(x: int | None) -> int | None:
+    """Quantize a MiB value DOWN to a coarse VRAM band so raw VRAM churn within a band
+    writes an identical companion row (C-EPOCH / gate bullet 2). None stays None."""
+    if x is None:
+        return None
+    return (int(x) // VRAM_BAND_MIB) * VRAM_BAND_MIB
+
+
+def _least_present(*vals: int | None) -> int | None:
+    """SQL LEAST() semantics for the probe-anchoring rule (C4): the smallest NON-NULL
+    value, or None if all are None. effective_free = LEAST(probe_floor, exporter_free):
+    a lying/stale exporter can never claim headroom the probe could not allocate."""
+    present = [v for v in vals if v is not None]
+    return min(present) if present else None
+
+
+def phantom_from_pids(per_pid, recognized_pids):
+    """OQ-P / Principle 3 — measured phantom. `per_pid` is a list of (pid, vram_mib) the
+    node physically reads off ITS OWN card. PIDs the fleet recognizes (its own lease-bound
+    inference servers) are ours; ALL unrecognized-PID VRAM is a phantom occupant (marker),
+    a DIRECT measurement, not a declared-footprint estimate. Returns (phantom_mib,
+    phantom_pids). Only the card-owning node ever calls this for its own card."""
+    recognized = set(recognized_pids or ())
+    unknown = [(p, m) for (p, m) in (per_pid or []) if p not in recognized]
+    return sum(m for _, m in unknown), len(unknown)
+
+
+def probe_floor(served_model, stats, *, scratch_floor_fn=None, residency_floor_fn=None):
+    """Probe-measured allocatable floor, gated PER-BACKEND (OQ-B / observer effect). The
+    peecee 'ollama-ondemand' slot uses a RESIDENCY-ONLY floor (a pure read; it can NEVER
+    force a load or allocate scratch); every other backend may use a scratch-allocation
+    floor. The shipped defaults read only the already-measured nvidia-smi free VRAM (NO
+    scratch allocation), so the build is live-infra-inert; tests inject a scratch_floor_fn
+    spy to prove the ollama-ondemand path never invokes it."""
+    if served_model == "ollama-ondemand":
+        rf = residency_floor_fn or (lambda s: s.get("vram_free_mib"))
+        return rf(stats)
+    sf = scratch_floor_fn or (lambda s: s.get("vram_free_mib"))
+    return sf(stats)
+
+
+def capacity_telemetry(served_model, stats, probe_ms, *,
+                       exporter_fn=None, per_pid_fn=None, recognized_pids=(),
+                       scratch_floor_fn=None, residency_floor_fn=None,
+                       fast_source_age_s=0.0, slow_source_age_s=0.0):
+    """Compute one slot's companion (capacity) fields from already-measured inputs. The
+    exporter / per-PID / scratch-floor readers are INJECTED seams (a node reads only its
+    OWN localhost exporter; default is inert => probe-anchored only, phantom 0), so units
+    use fakes and the build never reads real hardware. Returns a dict of the companion
+    columns the CAPACITY_UPSERT names (PK keys are merged in by the caller). All MiB
+    numbers are BANDED so within-band churn is a no-op; live_slowdown_factor is NOT here —
+    it is computed in SQL (BC3)."""
+    exporter = (exporter_fn() if exporter_fn else {}) or {}
+    floor_b = _band_mib(probe_floor(served_model, stats,
+                                    scratch_floor_fn=scratch_floor_fn,
+                                    residency_floor_fn=residency_floor_fn))
+    exporter_free_b = _band_mib(exporter.get("free_mib"))
+    eff = _least_present(floor_b, exporter_free_b)            # C4: trust the lower
+    phantom_mib, phantom_pids = phantom_from_pids(
+        per_pid_fn() if per_pid_fn else [], recognized_pids)
+    if eff is not None and phantom_mib:
+        eff = max(0, eff - phantom_mib)                      # OQ-P: phantom shrinks free
+    util = stats.get("gpu_util_pct")
+    return {
+        "cold_probe_ms": probe_ms,        # this tick's probe (numerator); SQL keeps the sticky baseline
+        "probe_floor_mib": floor_b,
+        "exporter_free_mib": exporter_free_b,
+        "effective_free_mib": _band_mib(eff),
+        "util_band": (util // UTIL_BAND_PCT) if util is not None else None,
+        "power_w": exporter.get("power_w"),
+        "temp_c": exporter.get("temp_c"),
+        "phantom_mib": phantom_mib,
+        "phantom_pids": phantom_pids,
+        # 'measured' whenever the card was reachable (a residency-only / failed-probe slot
+        # still yields a well-formed measured row; capacity_source is never 'absent' merely
+        # because live_slowdown_factor is NULL, BC3). 'absent' only when the GPU is unread.
+        "capacity_source": "measured" if stats.get("gpu_model") is not None else "absent",
+        "fast_source_age_s": fast_source_age_s,
+        "slow_source_age_s": slow_source_age_s,
+    }
+
+
+def absent_capacity_fields():
+    """A well-formed, fully-NULL companion field set for a crashed/unreachable probe, so a
+    _failed_row never KeyErrors the CAPACITY_UPSERT and writes a benign 'absent' row that
+    the reader COALESCEs straight through to today's vram_free_mib."""
+    return {
+        "cold_probe_ms": None, "probe_floor_mib": None, "exporter_free_mib": None,
+        "effective_free_mib": None, "util_band": None, "power_w": None, "temp_c": None,
+        "phantom_mib": 0, "phantom_pids": 0, "capacity_source": "absent",
+        "fast_source_age_s": None, "slow_source_age_s": None,
+    }
+
+
+# CAPACITY_UPSERT — the SEPARATE companion write (Slice 1 + 2). Runs AFTER the liveness
+# UPSERT under a savepoint (write_capacity), so a malformed/failed capacity write rolls
+# back ONLY itself and never sinks liveness (C3). live_slowdown_factor is computed IN SQL
+# (BC3): a None probe or a 0/None baseline yields NULL, never a TypeError/ZeroDivisionError.
+# The cold baseline is STICKY in the DB (F-BASE): once a baseline exists it is read back
+# and kept, so a heartbeat-process restart never recaptures a HOT baseline. EXCLUDED's
+# cold_probe_ms carries THIS tick's probe latency (the numerator); the persisted row's
+# cold_probe_ms is the sticky denominator.
+CAPACITY_UPSERT = """
+INSERT INTO gpu_slots_capacity (
+    node, endpoint_url, slot_id,
+    cold_probe_ms, live_slowdown_factor, probe_floor_mib, exporter_free_mib,
+    effective_free_mib, util_band, power_w, temp_c, phantom_mib, phantom_pids,
+    capacity_source, fast_source_age_s, slow_source_age_s, updated_ts)
+VALUES (
+    %(node)s, %(endpoint)s, %(slot_id)s,
+    %(cold_probe_ms)s,
+    -- First baseline => slowdown 1.0; a NULL or 0 baseline => NULL (BC3, no division). The
+    -- ::int casts type the bound param so a NULL probe_ms is not an AmbiguousParameter.
+    CASE WHEN %(cold_probe_ms)s::int IS NULL OR %(cold_probe_ms)s::int = 0
+         THEN NULL ELSE 1.0 END,
+    %(probe_floor_mib)s, %(exporter_free_mib)s, %(effective_free_mib)s,
+    %(util_band)s, %(power_w)s, %(temp_c)s,
+    COALESCE(%(phantom_mib)s, 0), COALESCE(%(phantom_pids)s, 0),
+    %(capacity_source)s, %(fast_source_age_s)s, %(slow_source_age_s)s, now())
+ON CONFLICT (node, endpoint_url, slot_id) DO UPDATE SET
+    -- F-BASE: STICKY cold baseline. COALESCE keeps the persisted (cold) baseline, so the
+    -- first passing probe (captured at registration, idle) stays the baseline forever and
+    -- a process restart never recaptures a hot one.
+    cold_probe_ms = COALESCE(gpu_slots_capacity.cold_probe_ms, EXCLUDED.cold_probe_ms),
+    -- BC3: live_slowdown_factor computed in SQL via CASE/NULLIF — NEVER a Python division.
+    -- A None probe (failed decode; every ollama-ondemand tick) or a 0/None baseline => NULL.
+    live_slowdown_factor = CASE
+        WHEN EXCLUDED.cold_probe_ms IS NULL
+          OR COALESCE(gpu_slots_capacity.cold_probe_ms, EXCLUDED.cold_probe_ms) IS NULL
+        THEN NULL
+        ELSE EXCLUDED.cold_probe_ms::numeric
+             / NULLIF(COALESCE(gpu_slots_capacity.cold_probe_ms, EXCLUDED.cold_probe_ms), 0)
+    END,
+    probe_floor_mib    = EXCLUDED.probe_floor_mib,
+    exporter_free_mib  = EXCLUDED.exporter_free_mib,
+    effective_free_mib = EXCLUDED.effective_free_mib,
+    util_band          = EXCLUDED.util_band,
+    power_w            = EXCLUDED.power_w,
+    temp_c             = EXCLUDED.temp_c,
+    phantom_mib        = EXCLUDED.phantom_mib,
+    phantom_pids       = EXCLUDED.phantom_pids,
+    capacity_source    = EXCLUDED.capacity_source,
+    fast_source_age_s  = EXCLUDED.fast_source_age_s,
+    slow_source_age_s  = EXCLUDED.slow_source_age_s,
+    updated_ts         = now()
+-- C-EPOCH / gate bullet 2: within-band churn is a NO-OP. The DO UPDATE fires only when a
+-- BANDED field actually changed, so two ticks whose raw VRAM/util differ but land in the
+-- SAME band leave the row BYTE-IDENTICAL (updated_ts not even re-stamped) — the companion
+-- analogue of the epoch CASE's IS DISTINCT FROM churn exclusion. The baseline / contention
+-- enrichment refreshes only on a real band crossing.
+WHERE  gpu_slots_capacity.probe_floor_mib    IS DISTINCT FROM EXCLUDED.probe_floor_mib
+    OR gpu_slots_capacity.exporter_free_mib  IS DISTINCT FROM EXCLUDED.exporter_free_mib
+    OR gpu_slots_capacity.effective_free_mib IS DISTINCT FROM EXCLUDED.effective_free_mib
+    OR gpu_slots_capacity.util_band          IS DISTINCT FROM EXCLUDED.util_band
+    OR gpu_slots_capacity.phantom_mib        IS DISTINCT FROM EXCLUDED.phantom_mib
+    OR gpu_slots_capacity.phantom_pids       IS DISTINCT FROM EXCLUDED.phantom_pids
+    OR gpu_slots_capacity.power_w            IS DISTINCT FROM EXCLUDED.power_w
+    OR gpu_slots_capacity.temp_c             IS DISTINCT FROM EXCLUDED.temp_c
+    OR gpu_slots_capacity.capacity_source    IS DISTINCT FROM EXCLUDED.capacity_source
+"""
+
+
+def write_capacity(conn, row) -> bool:
+    """Best-effort companion write under a SAVEPOINT (C3), AFTER the liveness UPSERT and
+    inside the SAME transaction, in both the push and pull paths (BC4). A malformed/failed
+    capacity write ROLLBACKs to the savepoint — undoing ONLY itself — and returns False,
+    so it can NEVER sink or roll back the liveness UPSERT. Capacity is best-effort
+    enrichment; liveness is the load-bearing fact."""
+    try:
+        conn.execute("SAVEPOINT cap")
+        conn.execute(CAPACITY_UPSERT, row)
+        conn.execute("RELEASE SAVEPOINT cap")
+        return True
+    except Exception:
+        try:
+            conn.execute("ROLLBACK TO SAVEPOINT cap")
+        except Exception:
+            pass
+        return False
+
+
+def capacity_staleness_s(fast_source_age_s, updated_age_s) -> float:
+    """BC2 single-clock staleness used by the hermetic decay tests, mirroring the SQL
+    `fast_source_age_s + GREATEST(0, now()-updated_ts)`. BOTH inputs are SAME-clock
+    DIFFERENCES (a node-clock age + a DB-clock age), so an absolute node<->DB NTP skew
+    cancels in each and is never load-bearing; a frozen source (age grows) or an unwritten
+    row (now()-updated_ts grows) still accrues staleness."""
+    return (fast_source_age_s or 0.0) + max(0.0, updated_age_s or 0.0)
+
+
+def is_fast_stale(staleness_s, *, decay_k, half_life_s) -> bool:
+    """Decay predicate: a fast capacity field is stale once its single-clock staleness
+    exceeds k * half_life (the same threshold the VIEW and inline pick use)."""
+    return staleness_s > decay_k * half_life_s
+
 
 # RFC 0002 Slice 3 Change A — best-effort per-node driver-lease CAS (push opt-in).
 # A self-pushing node attempts to hold its fleet_nodes lease as a COORDINATION SIGNAL
@@ -161,13 +394,29 @@ def gpu_stats(gpu_cmd: str, timeout: float = 20) -> dict | None:
     # uuid is appended (RFC 0002 measured identity); tolerate an older nvidia-smi /
     # gpu_cmd that does not emit it (then identity is unknown -> NULL, ratchet inert).
     uuid = parts[5] if len(parts) > 5 else None
+    # RFC 0005 (Slice 2): mig/ecc are the SLOW capability bands (indices 6,7). Same
+    # tolerance as uuid: an older nvidia-smi without them -> None (no spurious epoch bump,
+    # since NULL IS DISTINCT FROM NULL is false).
+    mig_mode = _norm_smi(parts[6] if len(parts) > 6 else None)
+    ecc_mode = _norm_smi(parts[7] if len(parts) > 7 else None)
     return {
         "gpu_model": name,
         "vram_total_mib": int(total),
         "vram_free_mib": int(free),
         "gpu_util_pct": int(float(util)) if util not in ("[N/A]", "") else None,
         "gpu_uuid": uuid or None,
+        "mig_mode": mig_mode,
+        "ecc_mode": ecc_mode,
     }
+
+
+def _norm_smi(val: str | None) -> str | None:
+    """Normalize an nvidia-smi capability field: an unsupported card reports '[N/A]'
+    (or empty), which we map to NULL so it never reads as a real, epoch-bumping band."""
+    if val is None:
+        return None
+    v = val.strip()
+    return v if v and v not in ("[N/A]", "N/A") else None
 
 
 def decode_probe(endpoint: str, model: str, timeout: float) -> tuple[bool, int | None, str | None]:
@@ -369,9 +618,19 @@ def heartbeat_once(conn: psycopg.Connection, args) -> dict:
         "latency_class": args.latency_class, "free_slots": args.free_slots,
         "epoch": args.epoch, "alive": alive, "probe_ms": probe_ms, "note": note,
         "gpu_uuid": stats.get("gpu_uuid"),
+        # RFC 0005 (F-KEYS): the shared UPSERT now names mig_mode/ecc_mode, so EVERY row
+        # dict must carry them or conn.execute(UPSERT, row) KeyErrors. gpu_stats parses
+        # them from local nvidia-smi (None on a card/driver that omits them).
+        "mig_mode": stats.get("mig_mode"), "ecc_mode": stats.get("ecc_mode"),
         "boot_epoch": next_boot_epoch() if push else None,
     }
     conn.execute(UPSERT, row)
+    # RFC 0005 (Slice 1+2): write the companion capacity row AFTER the liveness UPSERT,
+    # under the savepoint guard (C3), BEFORE the commit — so a malformed capacity write
+    # never sinks liveness. Best-effort enrichment; the return value is intentionally
+    # ignored (a False just means this tick has no fresh companion row).
+    cap = capacity_telemetry(served, stats, probe_ms)
+    write_capacity(conn, {**row, **cap})
     conn.commit()
     return {"node": args.node, "alive": alive, "probe_ms": probe_ms,
             "vram_free_mib": stats.get("vram_free_mib"), "note": note}

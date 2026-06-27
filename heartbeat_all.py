@@ -23,10 +23,13 @@ import psycopg
 
 from heartbeat import (
     UPSERT,
+    absent_capacity_fields,
+    capacity_telemetry,
     decode_probe,
     discover_served_model,
     gpu_stats,
     ollama_ondemand_liveness,
+    write_capacity,
 )
 
 # RFC 0002 Slice 3 Change B — the puller SKIPS a node whose per-node driver-lease is
@@ -114,6 +117,13 @@ def probe_node(n: dict) -> dict:
             n["endpoint_url"], n["probe_model"] or n["served_model"], DISCOVER_TIMEOUT)
         alive, probe_ms, probe_err = decode_probe(n["endpoint_url"], served, PROBE_TIMEOUT)
     note = "; ".join(x for x in (gpu_err, probe_err) if x) or None
+    # RFC 0005 (BC4): the puller computes the SAME companion telemetry it can reach for a
+    # pulled node and carries it in the row dict; pull_write issues the savepoint-guarded
+    # CAPACITY_UPSERT (closing the gap where pull-mode slots — including peecee — silently
+    # COALESCE-fell back to legacy vram_free). probe_node stays pure I/O (no DB): the
+    # telemetry is computed from the already-measured stats + injected adapters, never a
+    # GPU/exporter read of its own here.
+    cap = capacity_telemetry(served, stats, probe_ms)
     return {
         "node": n["node"], "endpoint": n["endpoint_url"], "slot_id": n["slot_id"],
         "gpu_model": stats.get("gpu_model"), "nvlink": n["nvlink_domain"],
@@ -126,7 +136,10 @@ def probe_node(n: dict) -> dict:
         # RFC 0002: the pull driver carries the MEASURED gpu_uuid (from nvidia-smi,
         # local or cross-host SSH) but leaves boot_epoch NULL — an HTTP/SSH probe has
         # no boot identity to stamp, so the ratchet stays inert for pull-driven rows.
+        # RFC 0005 (F-KEYS): mig_mode/ecc_mode carried so the shared UPSERT never KeyErrors.
         "gpu_uuid": stats.get("gpu_uuid"), "boot_epoch": None,
+        "mig_mode": stats.get("mig_mode"), "ecc_mode": stats.get("ecc_mode"),
+        **cap,
     }
 
 
@@ -143,7 +156,11 @@ def _failed_row(n: dict, exc: Exception) -> dict:
         "alive": False, "probe_ms": None, "note": f"probe crashed: {exc}",
         # NOT alive -> the UPSERT zeroes the streak / re-quarantines; a NULL uuid here
         # COALESCE-preserves any known identity, and boot_epoch stays inert (pull).
-        "gpu_uuid": None, "boot_epoch": None,
+        # RFC 0005 (F-KEYS): mig_mode/ecc_mode None (a crashed probe knows no capability;
+        # NULL IS DISTINCT FROM a prior NULL is false -> no spurious epoch bump). The
+        # absent capacity fields keep CAPACITY_UPSERT well-formed (a benign 'absent' row).
+        "gpu_uuid": None, "boot_epoch": None, "mig_mode": None, "ecc_mode": None,
+        **absent_capacity_fields(),
     }
 
 
@@ -217,6 +234,11 @@ def pull_write(conn: psycopg.Connection, row: dict) -> bool:
         conn.rollback()      # a self-pusher leased this node since the FETCH -> yield
         return False
     conn.execute(UPSERT, row)
+    # RFC 0005 (BC4): write the companion capacity row for the pulled node, under the same
+    # savepoint guard (C3), AFTER the liveness UPSERT and BEFORE the commit — so pull-mode
+    # slots (including peecee) get gpu_slots_capacity rows, and a companion failure
+    # ROLLBACK TO SAVEPOINTs without aborting the liveness write the puller already did.
+    write_capacity(conn, row)
     conn.commit()
     return True
 
