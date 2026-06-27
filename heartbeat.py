@@ -292,20 +292,17 @@ ON CONFLICT (node, endpoint_url, slot_id) DO UPDATE SET
     fast_source_age_s  = EXCLUDED.fast_source_age_s,
     slow_source_age_s  = EXCLUDED.slow_source_age_s,
     updated_ts         = now()
--- C-EPOCH / gate bullet 2: within-band churn is a NO-OP. The DO UPDATE fires only when a
--- BANDED field actually changed, so two ticks whose raw VRAM/util differ but land in the
--- SAME band leave the row BYTE-IDENTICAL (updated_ts not even re-stamped) — the companion
--- analogue of the epoch CASE's IS DISTINCT FROM churn exclusion. The baseline / contention
--- enrichment refreshes only on a real band crossing.
-WHERE  gpu_slots_capacity.probe_floor_mib    IS DISTINCT FROM EXCLUDED.probe_floor_mib
-    OR gpu_slots_capacity.exporter_free_mib  IS DISTINCT FROM EXCLUDED.exporter_free_mib
-    OR gpu_slots_capacity.effective_free_mib IS DISTINCT FROM EXCLUDED.effective_free_mib
-    OR gpu_slots_capacity.util_band          IS DISTINCT FROM EXCLUDED.util_band
-    OR gpu_slots_capacity.phantom_mib        IS DISTINCT FROM EXCLUDED.phantom_mib
-    OR gpu_slots_capacity.phantom_pids       IS DISTINCT FROM EXCLUDED.phantom_pids
-    OR gpu_slots_capacity.power_w            IS DISTINCT FROM EXCLUDED.power_w
-    OR gpu_slots_capacity.temp_c             IS DISTINCT FROM EXCLUDED.temp_c
-    OR gpu_slots_capacity.capacity_source    IS DISTINCT FROM EXCLUDED.capacity_source
+-- The companion row is re-stamped on EVERY tick (no within-band WHERE guard). updated_ts and
+-- the source-age fields ARE the freshness / liveness clock the reader decays against
+-- (capacity_staleness_s = fast_source_age_s + now()-updated_ts), so a live writer measuring
+-- stable, within-band values MUST keep advancing them — otherwise a healthy steady-state slot
+-- self-decays to 'stale' every k*half_life and the headroom signal silently erases (the reader
+-- COALESCEs back to vram_free). Re-writing a within-band-identical row is intentional and
+-- cheap: the companion carries NO epoch column, so it can never bump gpu_slots.epoch or fence a
+-- lease — C-EPOCH and the IS-DISTINCT-FROM churn exclusion live ENTIRELY in the gpu_slots
+-- liveness UPSERT (mig/ecc), not here. Frozen-source decay stays exact: a writer that STOPS
+-- ticking freezes updated_ts (now()-updated_ts grows past the threshold), and a writer that
+-- ticks against a frozen exporter carries a growing fast_source_age_s — both still decay.
 """
 
 

@@ -108,9 +108,13 @@ def test_capacity_upsert_stores_only_banded_values():
     assert "live_slowdown_factor = CASE" in cap and "NULLIF(" in cap
     # F-BASE: the cold baseline is sticky (COALESCE keeps the persisted cold one).
     assert "COALESCE(gpu_slots_capacity.cold_probe_ms, EXCLUDED.cold_probe_ms)" in cap
-    # within-band churn is a NO-OP: the DO UPDATE fires only when a banded field changed.
-    assert "WHERE  gpu_slots_capacity.probe_floor_mib    IS DISTINCT FROM" in cap
-    assert "IS DISTINCT FROM EXCLUDED.effective_free_mib" in cap
+    # Freshness is UNCONDITIONAL: the companion has no within-band WHERE guard, so updated_ts
+    # (the liveness clock the reader decays against) re-stamps every tick and a stable,
+    # within-band slot never self-decays. C-EPOCH churn exclusion lives in the gpu_slots epoch
+    # CASE below, NOT on the companion (which carries no epoch).
+    assert "updated_ts" in cap and "= now()" in cap
+    assert "IS DISTINCT FROM EXCLUDED" not in cap, \
+        "the companion DO UPDATE must NOT be gated by a within-band guard (it would freeze freshness)"
 
     # The gpu_slots epoch CASE references the SLOW capability bands (+ the existing trio)
     # but NOT the fast capacity bands (C-EPOCH: fast churn never bumps epoch).

@@ -175,6 +175,31 @@ def test_db_skew_keeps_fresh_slot_measured(db):
     assert picked[0]["degraded"] is False
 
 
+def test_within_band_tick_keeps_a_stable_slot_fresh(db):
+    # A2b (regression) — a LIVE writer whose measurement stays in the SAME band must keep the
+    # slot 'measured'. The freshness clock tracks WRITER LIVENESS (updated_ts), so a within-band
+    # tick MUST re-stamp updated_ts; otherwise a healthy, steady-state slot self-decays to
+    # 'stale' every k*half_life and the headroom signal silently erases (reader falls back to
+    # vram_free). Frozen-source decay is preserved by A3 (a writer that STOPS ticking) and by
+    # fast_source_age_s (a writer that ticks but reads a frozen source).
+    conn = db()
+    _seed_routable(conn)
+    params = _cap_params(probe_floor_mib=8000, effective_free_mib=8000, fast_source_age_s=0)
+    conn.execute(heartbeat.CAPACITY_UPSERT, params)            # tick 1 -> updated_ts = now()
+    # Simulate the slot sitting stable past the decay threshold: age its updated_ts so that,
+    # without a refresh, it is now 'stale'.
+    conn.execute("UPDATE gpu_slots_capacity SET updated_ts = now() - make_interval(secs => 120)")
+    assert pick_slot.pick(conn, model="m", k=5)[0]["capacity_source"] == "stale"
+    # The live writer's NEXT tick measures the SAME banded values (a genuine within-band tick).
+    # It must re-stamp updated_ts back to now() so the slot is measured again.
+    conn.execute(heartbeat.CAPACITY_UPSERT, params)            # tick 2 -> within-band
+    picked = pick_slot.pick(conn, model="m", k=5)
+    assert picked[0]["capacity_source"] == "measured", \
+        "a within-band tick from a LIVE writer must re-stamp updated_ts (no steady-state decay)"
+    assert picked[0]["effective_free_mib"] == 8000
+    assert picked[0]["degraded"] is False
+
+
 # =========================================================================== #
 # Gate bullet 2 — within-band churn no-op (D); MIG/ECC crossing fences (E).
 # =========================================================================== #
@@ -188,22 +213,31 @@ def test_within_band_churn_noop_and_no_epoch_bump(db):
     cap1 = {**_cap_params(), **heartbeat.capacity_telemetry(
         "m", {"gpu_model": "x", "vram_free_mib": 8000, "gpu_util_pct": 5}, 10)}
     conn.execute(heartbeat.CAPACITY_UPSERT, cap1)
-    ts1 = _companion(conn, "updated_ts")
+    # Age the row so the next within-band tick has a stale updated_ts to refresh FROM. On the
+    # old WHERE-guarded code this aged stamp would survive (the within-band write was a no-op)
+    # and the slot would self-decay; the fix re-stamps it to now().
+    conn.execute("UPDATE gpu_slots_capacity SET updated_ts = now() - make_interval(secs => 120)")
+    aged = _companion(conn, "updated_ts")
 
     cap2 = {**_cap_params(), **heartbeat.capacity_telemetry(
         "m", {"gpu_model": "x", "vram_free_mib": 8400, "gpu_util_pct": 5}, 10)}
     conn.execute(heartbeat.CAPACITY_UPSERT, cap2)
     ts2 = _companion(conn, "updated_ts")
 
-    assert ts2 == ts1, "within-band churn must be a byte-identical no-op (updated_ts unchanged)"
+    # A within-band move REFRESHES the companion's liveness clock (updated_ts jumps back to
+    # now()) — the freshness decay tracks writer liveness, so a stable slot must NOT freeze.
+    # What it must NOT do is touch the epoch or fence a held lease (C-EPOCH lives in gpu_slots).
+    assert ts2 > aged, "a within-band tick must re-stamp updated_ts (freshness tracks liveness)"
     assert _epoch(conn) == 0, "a fast-band move must NOT touch gpu_slots.epoch"
     assert leases.renew(conn, lease) is True, "a held lease survives a fast-band move (no self-abort)"
+    band_lo = _companion(conn, "effective_free_mib")          # the 8000-band stored value
 
-    # A genuine band CROSSING (8000 -> 16000) rewrites the companion row.
+    # A genuine band CROSSING (8000 -> 16000) stores the new band and STILL never bumps epoch.
     cap3 = {**_cap_params(), **heartbeat.capacity_telemetry(
         "m", {"gpu_model": "x", "vram_free_mib": 16000, "gpu_util_pct": 5}, 10)}
     conn.execute(heartbeat.CAPACITY_UPSERT, cap3)
-    assert _companion(conn, "updated_ts") != ts2, "a band crossing must rewrite the row"
+    assert _companion(conn, "effective_free_mib") != band_lo, "a band crossing stores the new band"
+    assert _epoch(conn) == 0, "even a fast-band CROSSING must NOT bump epoch (C-EPOCH)"
 
 
 def test_mig_ecc_crossing_bumps_epoch_and_fences(db):
