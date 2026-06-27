@@ -1,0 +1,25 @@
+---
+schema_version: striatum.decision.v1
+decision_id: "rfc-0005-design-override-bc1"
+run_id: "run_0e0a6f7601cc744dec24f48b43bea9e1"
+artifact_kind: decision
+owner: human
+outcome: accepted_with_follow_up
+follow_up_required: true
+title: "Accept BC1-BC5 as binding build constraints; supersede needs_revision (cycle budget exhausted, design spine sound)"
+created_at: "2026-06-26T23:46:34Z"
+---
+
+# Accept BC1-BC5 as binding build constraints; supersede needs_revision (cycle budget exhausted, design spine sound)
+
+Decision ID: `rfc-0005-design-override-bc1`
+Run ID: `run_0e0a6f7601cc744dec24f48b43bea9e1`
+Outcome: `accepted_with_follow_up`
+
+## Rationale
+
+The cycle-3 needs_revision verdict (re-derived fresh by a second adjudicator session) is honest, and its design SPINE survived falsification intact: C-EPOCH (fast capacity bands never bump epoch and gate new claims only; only slow mig/ecc bands bump epoch and fence held leases), companion-table savepoint-guarded fault isolation, LEAST(probe_floor,exporter) probe-anchoring, phantom-shrink over self-lease, the fleet-floor dead-man guard, additive/reversible Migration 010, the residency-only ollama-ondemand floor, and the live-infra-inert posture were all cleared by both falsifiers. The single landed_unrebutted blocker is BC1 (Slice 3 ships the headroom SQL but no production path to supply model_footprint/max_context, references an undefined kv_bytes, and leaves the di --json boundary unreconciled). The adjudicator itself concluded BC1 is dischargeable in ONE cycle WITHOUT re-opening the settled RFC: di-fleet already splits --model and the context flags at _split_argv, so model_footprint comes from a registry-side model->mib policy row and max_context from the already-handled argv with no engine import and no live-hardware read; kv_bytes is a defined Python helper or a 010-created SQL function; the same inputs thread through route_slots/first-claim/failover; an e2e di_fleet.main() test pins 32k-vs-4k divergence. This is a well-scoped, dischargeable BUILD constraint, not an undischargeable design defect (hence needs_revision, not reject). The gate is stuck only because the workflow revision loop (max_iterations=2) routed both cycles to re-challenge rather than producing a holder revision (byte-identical plan across all three cycles) - a template routing limitation, not a design rejection. Superseding: the committer MUST fold BC1-BC5 into COMMITTED_PLAN.md as binding constraints; the build MUST implement BC1 and its e2e 32k-vs-4k falsifying test; the independent build verifier MUST confirm BC1 and BC2 gate tests before accept. (Run also survived two unrelated shared-striatumd restarts during this session - a boot-epoch orphan recovered via supervise stop + re-drive, and a migration-31 crash loop operator-resolved - neither affects the verdict substance.)
+
+## Follow-Up
+
+Build discharges, under the build stage independent falsifiable-gate verifier: BC1 (blocking) - define the request-capacity contract: source model_footprint (registry model->mib policy row) and max_context (di-fleet argv, already split at _split_argv) at the di-fleet layer with NO engine import and NO live-hardware read (escalate if neither suffices); define kv_bytes explicitly and name its owning slice (010 SQL function / generated column / policy lookup / Python helper); thread the SAME inputs through route_slots/pick, first-attempt run_leased_shard/claim, AND failover run_failover_shard/claim (a defaulted kwarg production never populates does NOT satisfy this); restate C7 for production threading; add an e2e di_fleet.main() test proving a 32k request is refused and a 4k request accepted on the SAME slot whose effective_free sits between the two headroom thresholds. BC2 (gate) - single-CLOCK staleness (node-local now minus source_ts, both node-sampled); keep source_ts as the source measurement time (do NOT stamp it with DB now(), which defeats frozen-exporter detection); test BOTH skew-resistance AND frozen-source decay. BC3 (policy) - guard live_slowdown_factor against probe_ms None (failed probe; and ollama-ondemand residency-only which returns probe_ms None every tick by design) and cold_probe_ms None/0 (write NULL/sentinel + capacity_source absence, never raise, inside the savepoint-guarded boundary); define the ollama-ondemand no-baseline rule; add failed-probe + cold-ollama-ondemand tests. BC4 (policy) - wire CAPACITY_UPSERT into the puller write-path (heartbeat_all.py pull_write/tick) with the same separate-savepoint-guarded discipline so pull-mode slots (peecee) get companion rows; add a puller integration test. BC5 (policy) - disambiguate slices independently COMMITTABLE (green under hermetic pytest) but NOT freely deploy-ordered (Slice 2 mig/ecc ride the non-savepoint-guarded liveness UPSERT, so DB-first apply order before 010 is a hard precondition); keep mig/ecc in the gpu_slots UPSERT epoch CASE; no runtime column probing. Preserve everything under What-survived and do NOT re-open the settled RFC; the build verifier gates on BC1 e2e test and BC2 skew+frozen tests.
