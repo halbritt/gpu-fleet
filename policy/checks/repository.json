@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "registry_version": 1,
+  "checks": [
+    {
+      "check_id": "fd5b1a253926e258fdcf0c1bde3abe40f69c5a82b9a2981bb08119397db2becb",
+      "argv": [
+        "/usr/bin/python3",
+        "-m",
+        "compileall",
+        "-q",
+        "."
+      ],
+      "binary_hash": "e1efa562c2cc2e35521a5c9c9b9939921001ff8ca9708a13ef15ace68cc2ccd7",
+      "env_spec": {},
+      "cwd_spec": "workspace",
+      "input_spec": "subject-tree",
+      "resource_limits": {
+        "wall_clock_s": 120
+      },
+      "network": false,
+      "runtime_class": "slow"
+    },
+    {
+      "check_id": "6b2f0875e72f71995b4230056df38f92a042311de25b38387401638126621067",
+      "argv": [
+        "/usr/bin/test",
+        "-s",
+        "body"
+      ],
+      "binary_hash": "854ed66843b5586f657563b3e9a838c46d47b9f44cb7a301534a4b8d2c10297a",
+      "env_spec": {
+        "LC_ALL": "C"
+      },
+      "cwd_spec": "workspace",
+      "input_spec": "subject-tree",
+      "resource_limits": {
+        "wall_clock_s": 30
+      },
+      "network": false,
+      "runtime_class": "fast"
+    }
+  ],
+  "sets": {
+    "code": [
+      "fd5b1a253926e258fdcf0c1bde3abe40f69c5a82b9a2981bb08119397db2becb"
+    ],
+    "subject-default": [
+      "6b2f0875e72f71995b4230056df38f92a042311de25b38387401638126621067"
+    ]
+  }
+}
