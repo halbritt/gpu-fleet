@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
-.striatum/
+# Striatum: graph identity (.striatum/graph.json) is committed; scratch/worktrees are never state (P10).
+/.striatum/scratch/
+/.striatum/worktrees/
 
 # coordination/intero proof-of-life — local per-box, not history (showerthoughts coordination/intero/SPEC.md)
 .intero.json
