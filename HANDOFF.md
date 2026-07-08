@@ -40,11 +40,26 @@ Read artifact bodies: `python3 <scratchpad>/read-artifact.py <identity-substring
   gates 297/345). Plan lowers design C1–C11 into 3 packets: `migration-011`
   (`migrations/011_peecee_qwen3_vl.sql`), `readme-currency` (README peecee
   example), `changeset-gate` (mutation-free audit).
-- **In flight:** work-graph v352 failed `work-graph-legality`
-  (`changeset-gate` packet has empty `write_scope`; gate refuses `no_write_scope`).
-  Packetization-revision run 367 (dispatch `590d7042…`) live on claude-code since
-  16:30Z, dispatched from the wake unit (delegated cgroup — safe). Next: legality
-  gate re-check, then build packets, then acceptance of the change-set.
+- **In flight (updated ~22:4x):** campaign now under **RQ-561** (RQ-365 canceled
+  583 after its cancel_request resolution 560 recorded without executing — the
+  request stayed live and double-dispatched). Plan head **v509 accepted** (gate
+  524, codex r7 zero findings). Two duplicate r9 plan-revision lanes (runs
+  563/566, claude-harm) were in flight at the double-dispatch; their candidates
+  will review out. **The packetization poison is cured at the scheduling layer:**
+  packetization is catalog-D1 and belongs to the mechanical `local` backend
+  (rank=0); the new `claude-harm` backend also claimed it at rank=0 and won the
+  name-order tiebreak, and its Opus lanes transcribed the *stale plan pin from
+  the refused-work-graph diagnostic* into their outputs (dispatches pinned
+  correctly — runs 451/528 outputs pinned superseded heads), driving the D1
+  upstream-indictment to revise the innocent plan to bounds_exhausted twice
+  (escalations 461, 558). claude-harm no longer claims packetization
+  (striatum-next `700bde1`, declaration_version 2); finding registered as
+  `deterministic-passes-run-deterministically@1` (`831dfbe`). **Correction to
+  resolution 560's ledger note:** it blames an acceptance-session race; the real
+  mechanism is the lane pin-transcription above (correct analysis recorded in
+  cancellation 583's reason). Next: r9 review cycle → acceptance (wrapped, explicit
+  flags) → packetization on `local` (correct pins) → legality → build packets →
+  change-set acceptance.
 
 ## Adjudication card (measured 2026-07-07 on peecee, live host settings)
 
