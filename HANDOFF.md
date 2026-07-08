@@ -108,3 +108,18 @@ re-admit marker co-residency under the 8B's small footprint — see proposal
   third finding: run 214's drained-but-never-closed failed submission.
 - striatum-next escalation **9330** (graduated-acceptance, bounds_exhausted) is
   NOT in this delegation — the Principal's, likely healable post-fixes.
+- **INCIDENT DISCLOSURE (2026-07-08 ~21:5x): resolution 463 landed accidentally.**
+  While reading escalation 461 (bounds_exhausted after stale packetization run 451
+  burned the plan's revision budget), a bare `striatum resolve 461` — run expecting
+  a usage listing, as bare `cancel` prints — appended `{disposition: proceed,
+  note: ""}` because **the CLI defaults the disposition to `proceed`**
+  (`internal/cli/root.go`; registered upstream as
+  `resolutions-carry-their-deliberation@1`, striatum-next `bf229e1`). No
+  un-resolve exists. The disposition matches the on-merits adjudication I was
+  converging on (the exhaustion was caused by run 451 revising the *mooted*
+  no_write_scope refusal against a stale plan pin — the accepted v411 head
+  already embeds the cure, so continuation is sound and the alternatives —
+  cancel_request/reissue — would discard accepted heads for no gain), but the
+  note is empty on the ledger; this paragraph and the session transcript are the
+  deliberation record. **Never invoke `resolve` without an explicit
+  `--disposition` and `--note`.**
