@@ -53,7 +53,7 @@ python3 heartbeat.py --node proximal --endpoint http://localhost:8081/v1 \
 
 # proximal-driven heartbeat for a node that can't self-report yet (Windows desktop):
 python3 heartbeat.py --node peecee --endpoint http://peecee:11434/v1 \
-    --served-model qwen3.6:27b --latency-class batch --max-context 32768 \
+    --served-model qwen3-vl:8b --latency-class batch --max-context 32768 \
     --gpu-cmd "ssh -o BatchMode=yes peecee nvidia-smi"
 
 # a consumer claims slots by capability (di fan-out width K):

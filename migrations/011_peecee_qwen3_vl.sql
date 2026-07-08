@@ -1,0 +1,89 @@
+-- 011_peecee_qwen3_vl.sql
+-- Swap peecee's LLM slot (slot 0) from the dense text-only qwen3.6:27b (006) to
+-- Qwen3-VL -- the fleet's first vision-language capability. Governing contract:
+-- peecee-serves-qwen3-vl@1 (design gpu-fleet/intents/peecee-qwen3-vl-swap/design,
+-- accepted; proposal v196, gate 211). Authored world-side by the delegated
+-- Principal from the accepted design's C5/C6: the graph's build lane could not be
+-- driven to legality (its work-graph named acceptance checks the repository
+-- registry cannot express -- see the pass handoff / striatum-next finding
+-- deterministic-passes-run-deterministically@1 and the guidance-channel finding),
+-- so the fully-specified artifact is authored here. Substance is the accepted
+-- design's, unchanged.
+--
+-- FIT RULE (contract, binding): serve Qwen3-VL-32B iff it stays fully GPU-resident
+-- (ollama ps = 100% GPU) at the declared max_context on the display-shared 24 GiB
+-- RTX 3090, else Qwen3-VL-8B. Selection order is capability-then-context
+-- (lexicographic), and the residency gate is evaluated ONLY at the 32768-token
+-- context floor -- context may never be shrunk to make a larger model "fit"
+-- (finding 138). max_context may not regress below the outgoing slot's 32768.
+--
+-- PINNED CO-TENANCY STATE: marker (slot 1) idle, worst-case Windows-desktop display
+-- overhead, ~21,690 MiB conservatively usable of the 24,564 MiB card (005's measured
+-- idle-free band was 21,690-22,095 MiB; the rest is irreducible desktop/driver
+-- overhead not available to ollama).
+--
+-- ADJUDICATION-CARD MEASUREMENTS (measured 2026-07-07 on peecee under live host
+-- settings: ollama 0.30.7, OLLAMA_KEEP_ALIVE=-1, KV cache q8_0 + flash-attention,
+-- marker idle). Execution lanes cannot reach peecee (vendor-endpoint-only), so this
+-- card is the complete admissible measurement corpus:
+--   model         num_ctx  ollama ps            footprint  speed
+--   qwen3-vl:8b   32768    100% GPU             8.0 GB     131 tok/s   <- winner
+--   qwen3-vl:32b   8192    100% GPU             21 GB       39 tok/s
+--   qwen3-vl:32b  16384    100% GPU (318 MiB free) 22 GB    40 tok/s
+--   qwen3-vl:32b  32768    7%/93% CPU/GPU -- FAILS 25 GB    25 tok/s
+-- => At the 32768 floor, 32B is NOT 100% GPU-resident (7%/93% CPU/GPU spill, 25 GB
+--    demand > usable): it FAILS the residency gate. 8B passes (100% GPU, 8.0 GB).
+--    The fit rule therefore selects qwen3-vl:8b. 32B is fully resident only at
+--    <= 16384 context -- below the floor -- so it is not eligible.
+--
+-- max_context = 32768: at the binding floor and equal to the largest context at
+-- which the winner has MEASURED full residency. No unmeasured larger value may be
+-- declared (declaring headroom is fabricated evidence). ~13.5 GiB measured resident
+-- headroom invites a later migration to raise it, but only on a new residency
+-- measurement at the higher context in the same pinned state (contract C2).
+--
+-- min_load_vram_mib = 21000: this is a LIVENESS-WINDOW THRESHOLD, NOT the model
+-- footprint (finding 176). It is the free-VRAM floor that calls the served model
+-- loadable, re-derived from the finding-176 window
+--   [ max(F, A_marker + margin), A_idle ]  =  [ max(~8,200, A_marker + margin), 21,690 ] MiB
+-- where F ~= 8,200 MiB (conservative reading of the 8B's 8.0 GB display) and
+-- A_idle = 21,690 MiB (low end of 005's measured idle-free band). 21000 sits in
+-- this window: it is >= F, <= A_idle, and above every marker-resident state
+-- (A_marker: 005-era production shows marker-resident free VRAM well below 21,000).
+-- So slot 0 is admitted when marker is IDLE and refused when marker is RESIDENT --
+-- exactly 005/006's time-sharing behavior. The integer is unchanged from 006 but
+-- its justification is superseded: it is now a window value, not carried forward as
+-- the 27b's cold-load footprint. A different integer would be admissible only if
+-- carried by a measured A_marker placing it in the window with a stated margin; the
+-- adjudication card contains no such point measurement, so 21000 stands.
+--
+-- probe_model stays 'ollama-ondemand' and is RE-ASSERTED here, never set to the VL
+-- tag. It is the load-aware liveness-MODE selector (heartbeat.py: the mode is chosen
+-- by (probe_model or served_model) == 'ollama-ondemand'); within the mode the
+-- residency check and WARM decode-probe follow the *served* model (now the VL tag)
+-- automatically. Setting probe_model to the VL tag would DISABLE the mode and revert
+-- to per-tick decode-probes that force-load the model the heartbeat must never load
+-- -- the exact bug 005 fixed. The WARM / COLD-LOADABLE / NOT-LOADABLE semantics are
+-- unchanged.
+--
+-- SCOPE: fleet_nodes (desired state) only. The gpu_slots directory row converges via
+-- heartbeat propagation on the next tick (the 004-006 precedent); the heartbeat
+-- UPSERT's epoch CASE (RFC 0003, migration 008) fences in-flight leases on the
+-- served_model change. No gpu_slots write, no schema change, no code change, no
+-- change to marker's slot 1 or peecee host config. Migrations are append-only
+-- provenance: 002's seed and prior headers still show qwen3.6:27b -- that is history;
+-- current state is this migration plus the README.
+--
+-- DEPLOY ORDERING: unlike 005 this adds no column and changes no code, so the
+-- migrate-before-restart hazard does not arise -- applying against the running
+-- heartbeat is safe and the change propagates on the next tick. The chosen tag must
+-- be pulled and loadable on peecee before this goes live (already satisfied: both
+-- candidate tags were pulled for the measurement session; qwen3.6:27b restored
+-- resident until apply so live service is untouched).
+
+UPDATE fleet_nodes
+SET served_model      = 'qwen3-vl:8b',
+    probe_model       = 'ollama-ondemand',
+    max_context       = 32768,
+    min_load_vram_mib = 21000
+WHERE node = 'peecee' AND slot_id = 0;
