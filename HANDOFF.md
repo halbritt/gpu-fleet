@@ -27,24 +27,24 @@ Read artifact bodies: `python3 <scratchpad>/read-artifact.py <identity-substring
 `~/.local/share/striatum/graphs/019f3d37-*/objects/sha256/xx/yy/<hash>.zst`,
 **skip 16-byte `SOB1zstd` header** before `zstd -dc`).
 
-## State at handoff
+## State at handoff (updated 2026-07-08 ~16:35 UTC)
 
-- RQ-1 captured: satisfied. RQ-3: canceled (my error — issued without `--note`).
-- **RQ-109 `peecee-serves-qwen3-vl`: satisfied [Asserted] — HOLLOW.** The v0
-  observation pass echoed the request note into an ECR one second after issue.
-  Floor artifact; the real close is still owed (see "Remaining"). Do not cite it
-  as done.
-- **RQ-2 `work-graph-integrated`: executing.** Proposal v196 ACCEPTED (gate 211)
-  after 3 adversarial-review revision cycles that materially strengthened the fit
-  rule. **Design-convergence run 214 is stuck**: its lane crashed instantly twice
-  at 22:41 (empty transcripts, `runtime_crash`, cause unknown — NOT the PATH or
-  KillMode bugs, both fixed; prompt ~30 KB so not argv limits). The failed
-  submission was drained (ledger 219/220) but the run was **never closed or
-  redispatched** — possible driver gap worth reporting upstream. Its 6 h batch
-  deadline passed at 04:41; the next wake should abandon + redispatch. **First
-  thing: check `$S status` — if run 214 is still expected, investigate; if a new
-  design run is live, just monitor.** If the redispatched lane also insta-crashes,
-  read `~/.local/share/striatum/exchange/019f3d37-*/spool/submissions/<dispatch>/exhaust/`.
+- RQ-1 captured: satisfied. RQ-3: canceled (issued without `--note`).
+- **RQ-109 `peecee-serves-qwen3-vl`: satisfied [Asserted] — HOLLOW.** Floor
+  artifact; the real close is still owed (see "Remaining"). Do not cite it as done.
+- **Campaign now under RQ-365** (RQ-2 → canceled 277, RQ-278 → canceled 364; each
+  cancel+re-request recovered a lane killed by the in-session-dispatch trap below —
+  accepted heads carry across requests).
+- **Accepted heads:** proposal v196 (gate 211) · design v251 (codex review zero
+  findings, gates 264/267) · implementation-plan v285 (codex review zero findings,
+  gates 297/345). Plan lowers design C1–C11 into 3 packets: `migration-011`
+  (`migrations/011_peecee_qwen3_vl.sql`), `readme-currency` (README peecee
+  example), `changeset-gate` (mutation-free audit).
+- **In flight:** work-graph v352 failed `work-graph-legality`
+  (`changeset-gate` packet has empty `write_scope`; gate refuses `no_write_scope`).
+  Packetization-revision run 367 (dispatch `590d7042…`) live on claude-code since
+  16:30Z, dispatched from the wake unit (delegated cgroup — safe). Next: legality
+  gate re-check, then build packets, then acceptance of the change-set.
 
 ## Adjudication card (measured 2026-07-07 on peecee, live host settings)
 
@@ -82,8 +82,20 @@ re-admit marker co-residency under the 8B's small footprint — see proposal
 
 ## Traps learned (details: memory `striatum-fleet-driving`, `~/git/proximal/systemd-user/`)
 
-- **Never `striatum drive` from inside a Claude Code session** — lanes die with
-  empty transcripts. Use the wake unit.
+- **ROOT CAUSE FOUND (2026-07-08): every in-session Principal verb that unblocks
+  work dispatches lanes into the caller's cgroup.** `accept` runs an inline drive;
+  from an SSH/Claude session the supervisor lands in the undelegated
+  `session-N.scope` and `createLaneCgroup` gets EPERM — lanes die at birth with
+  empty transcripts (runs 214/270/357; principal-trigger sessions 217/273/360).
+  This subsumes the old "never `striatum drive` in-session" trap. **Wrap every
+  in-session verb:** `systemd-run --user --scope -p Delegate=yes --quiet -- $S
+  accept … --reason "…"` (verified), or just wake the unit and adjudicate on the
+  next pass. Registered upstream: `dispatches-inherit-a-delegated-subtree@1`
+  (striatum-next `1e74a43`); the zombie-run half is
+  `failed-submissions-close-their-run@1` (`8d08441`). Supervisor binaries in
+  `~/.local/bin/striatum-backend-*` must be rebuilt after striatum-next pulls
+  (they lagged edda5bf's crash-reason persistence by 9 minutes, hiding this for
+  18 hours). `accept` takes `--reason`, not `--note`.
 - Product-state requests produce their conjuncts **under the requesting
   request**: only request them at close, with facts in `--note` (RQ-3/RQ-109
   lessons).
