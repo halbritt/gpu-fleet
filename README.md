@@ -15,6 +15,10 @@ single point of failure.
   leave, and crash are the same self-healing event.
 - **Liveness is a real decode-probe** (a 1-token completion), not an HTTP
   `/health` 200 — a wedged model loop serves 200s while failing to decode.
+  While a consumer lease is active, the heartbeat uses GPU reachability instead
+  so its diagnostic request cannot queue behind real work on a single-slot
+  server and falsely fence the holder. Decode verification resumes on the first
+  unleased tick.
 - **Addressing is by capability** (`served_model`, `vram_free_mib`,
   `latency_class`, `nvlink_domain`), never by host identity. NVLink pairs share
   an `nvlink_domain` tag and act as one larger tensor-parallel slot.

@@ -67,7 +67,9 @@ VALUES (
 ON CONFLICT (node, endpoint_url, slot_id) DO UPDATE SET
     gpu_model=EXCLUDED.gpu_model, nvlink_domain=EXCLUDED.nvlink_domain,
     vram_total_mib=EXCLUDED.vram_total_mib, vram_free_mib=EXCLUDED.vram_free_mib,
-    gpu_util_pct=EXCLUDED.gpu_util_pct, loaded_model=EXCLUDED.loaded_model,
+    gpu_util_pct=EXCLUDED.gpu_util_pct,
+    loaded_model=CASE WHEN %(probe_verified)s OR NOT EXCLUDED.alive
+                      THEN EXCLUDED.loaded_model ELSE gpu_slots.loaded_model END,
     served_model=EXCLUDED.served_model, max_context=EXCLUDED.max_context,
     latency_class=EXCLUDED.latency_class, free_slots=EXCLUDED.free_slots,
     -- RFC 0003: PRESERVE the existing epoch and bump it by 1 only when a
@@ -104,17 +106,27 @@ ON CONFLICT (node, endpoint_url, slot_id) DO UPDATE SET
     -- inherit the prior streak; trust carries forward only on a matching/unknown uuid.
     probe_streak = CASE
         WHEN NOT EXCLUDED.alive THEN 0
+        -- A lease-time GPU check is weaker than a decode. Demote a previously
+        -- routable row to one-decode-away and never let weak checks promote it.
+        WHEN NOT %(probe_verified)s THEN
+            CASE WHEN gpu_slots.status = 'routable' THEN {GRADUATION_STREAK} - 1
+                 ELSE gpu_slots.probe_streak END
         WHEN gpu_slots.gpu_uuid IS NOT NULL AND EXCLUDED.gpu_uuid IS NOT NULL
              AND gpu_slots.gpu_uuid <> EXCLUDED.gpu_uuid THEN 1
         ELSE gpu_slots.probe_streak + 1 END,
     status = CASE
         WHEN NOT EXCLUDED.alive THEN 'unverified'
+        WHEN NOT %(probe_verified)s THEN
+            CASE WHEN gpu_slots.status = 'routable' THEN 'probationary'
+                 ELSE gpu_slots.status END
         WHEN gpu_slots.gpu_uuid IS NOT NULL AND EXCLUDED.gpu_uuid IS NOT NULL
              AND gpu_slots.gpu_uuid <> EXCLUDED.gpu_uuid THEN 'unverified'
         WHEN gpu_slots.status = 'routable' THEN 'routable'
         WHEN gpu_slots.probe_streak + 1 >= {GRADUATION_STREAK} THEN 'routable'
         ELSE 'probationary' END,
-    alive=EXCLUDED.alive, probe_ms=EXCLUDED.probe_ms,
+    alive=EXCLUDED.alive,
+    probe_ms=CASE WHEN %(probe_verified)s OR NOT EXCLUDED.alive THEN EXCLUDED.probe_ms
+                  ELSE gpu_slots.probe_ms END,
     -- RFC 0005: persist the measured slow capability bands (their change drove the epoch
     -- CASE above). COALESCE-free: a NULL report (older nvidia-smi) overwrites with NULL,
     -- and NULL IS DISTINCT FROM NULL is false, so it never spuriously bumps epoch.
@@ -614,6 +626,7 @@ def heartbeat_once(conn: psycopg.Connection, args) -> dict:
         "served_model": served, "max_context": args.max_context,
         "latency_class": args.latency_class, "free_slots": args.free_slots,
         "epoch": args.epoch, "alive": alive, "probe_ms": probe_ms, "note": note,
+        "probe_verified": True,
         "gpu_uuid": stats.get("gpu_uuid"),
         # RFC 0005 (F-KEYS): the shared UPSERT now names mig_mode/ecc_mode, so EVERY row
         # dict must carry them or conn.execute(UPSERT, row) KeyErrors. gpu_stats parses

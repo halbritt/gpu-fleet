@@ -78,6 +78,7 @@ def _hb_row(**over):
         "loaded_model": "m", "served_model": "m", "max_context": 8192,
         "latency_class": "batch", "free_slots": 1, "epoch": 0,
         "alive": True, "probe_ms": 12, "note": None,
+        "probe_verified": True,
         "gpu_uuid": None, "boot_epoch": None, "mig_mode": None, "ecc_mode": None,
     }
     row.update(over)
@@ -330,7 +331,8 @@ def test_puller_writes_companion_row(db):
            "gpu_model": "RTX 3090", "nvlink": None, "vram_total": 24000, "vram_free": 22000,
            "util": 5, "loaded_model": "m", "served_model": "m", "max_context": 8192,
            "latency_class": "batch", "free_slots": 1, "epoch": 0, "alive": True,
-           "probe_ms": 10, "note": None, "gpu_uuid": "U", "boot_epoch": None,
+           "probe_ms": 10, "note": None, "probe_verified": True,
+           "gpu_uuid": "U", "boot_epoch": None,
            "mig_mode": None, "ecc_mode": None, **cap}
     wconn = psycopg.connect(TEST_DB)            # autocommit OFF -> savepoint valid
     try:
@@ -344,6 +346,36 @@ def test_puller_writes_companion_row(db):
         "WHERE node = 'peecee'").fetchone()
     assert got is not None, "the puller must write a companion row for the pulled node"
     assert got[0] == "measured"
+
+
+def test_active_lease_heartbeat_stays_renewable_but_requires_postlease_decode(db):
+    conn = db()
+    conn.execute(
+        "INSERT INTO fleet_nodes "
+        "(node, slot_id, endpoint_url, served_model, probe_model, latency_class) "
+        "VALUES (%s, %s, %s, 'm', 'm', 'batch')",
+        (NODE, SLOT_ID, URL),
+    )
+    _seed_routable(conn)
+    lease_id = leases.claim(conn, SLOT, "activation-test")
+    assert lease_id is not None
+
+    conn.execute(
+        heartbeat.UPSERT,
+        _hb_row(probe_verified=False, probe_ms=None, note="lease active"),
+    )
+    status, streak, probe_ms = conn.execute(
+        "SELECT status, probe_streak, probe_ms FROM gpu_slots WHERE node = %s", (NODE,)
+    ).fetchone()
+    assert (status, streak, probe_ms) == ("probationary", 2, 12)
+    assert leases.renew(conn, lease_id) is True
+
+    leases.release(conn, lease_id)
+    conn.execute(heartbeat.UPSERT, _hb_row(probe_verified=True, probe_ms=15))
+    status, streak = conn.execute(
+        "SELECT status, probe_streak FROM gpu_slots WHERE node = %s", (NODE,)
+    ).fetchone()
+    assert (status, streak) == ("routable", 3)
 
 
 # =========================================================================== #

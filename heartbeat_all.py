@@ -2,12 +2,13 @@
 """gpu-fleet heartbeat driver: refresh EVERY declared node, every tick, forever.
 
 Reads the desired fleet from `fleet_nodes` on each iteration (so adding a node is
-a pure INSERT -- no restart needed), runs nvidia-smi + a decode-probe per node,
-and UPSERTs gpu_slots. A node that fails its probe is written `alive=false` and
-ages out of `live_slots`; a node that reappears comes back automatically. One
-node's failure (timeout, ssh down) never blocks the others. Built to run under a
-Restart=always systemd-user service so the registry stays live with zero human
-intervention.
+a pure INSERT -- no restart needed), probes its GPU and model, and UPSERTs
+gpu_slots. A node that fails its probe is written `alive=false` and ages out of
+`live_slots`; a node that reappears comes back automatically. While a consumer
+lease is active, GPU reachability replaces the contending decode probe; normal
+decode verification resumes after release. One node's failure (timeout, ssh
+down) never blocks the others. Built to run under a Restart=always systemd-user
+service so the registry stays live with zero human intervention.
 """
 
 from __future__ import annotations
@@ -40,14 +41,21 @@ from heartbeat import (
 # behavior, so the puller drives every node until a push sidecar is deployed.
 FETCH = """
 SELECT node, slot_id, endpoint_url, served_model, probe_model, latency_class,
-       gpu_cmd, nvlink_domain, max_context, free_slots, epoch, min_load_vram_mib
+       gpu_cmd, nvlink_domain, max_context, free_slots, epoch, min_load_vram_mib,
+       COALESCE((
+           SELECT gpu_slots.lease_id IS NOT NULL
+              AND now() < gpu_slots.lease_expires
+             FROM gpu_slots
+            WHERE (gpu_slots.node, gpu_slots.endpoint_url, gpu_slots.slot_id)
+                = (fleet_nodes.node, fleet_nodes.endpoint_url, fleet_nodes.slot_id)
+         ), false) AS lease_active
 FROM fleet_nodes
 WHERE enabled AND (driven_by IS NULL OR now() >= lease_until)
 ORDER BY node, slot_id
 """
 COLS = ["node", "slot_id", "endpoint_url", "served_model", "probe_model",
         "latency_class", "gpu_cmd", "nvlink_domain", "max_context", "free_slots",
-        "epoch", "min_load_vram_mib"]
+        "epoch", "min_load_vram_mib", "lease_active"]
 
 # RFC 0002 Slice 2 — global puller-lease (peer-runnable driver; kills the SPOF). A CAS
 # on the single fleet_meta row: the holder drives the tick and renews; a standby loses
@@ -96,7 +104,15 @@ def probe_node(n: dict) -> dict:
     the caller owns the single DB connection and does the write."""
     stats = gpu_stats(n["gpu_cmd"], GPU_TIMEOUT) or {}
     gpu_err = stats.pop("_error", None)
-    if (n["probe_model"] or n["served_model"]) == "ollama-ondemand":
+    if n.get("lease_active"):
+        # Diagnostic decode would contend with the holder on a single-slot server.
+        # This weaker positive check cannot promote the slot; UPSERT demotes it to
+        # one verified decode away from routable until the lease is released.
+        served = n["served_model"]
+        alive = gpu_err is None and stats.get("gpu_model") is not None
+        probe_ms = None
+        probe_err = "lease active: decode probe suppressed" if alive else None
+    elif (n["probe_model"] or n["served_model"]) == "ollama-ondemand":
         # Load-aware liveness for the on-demand ollama MoE that shares its card
         # with marker. Evaluated BEFORE the decode path so the heartbeat never
         # forces a load (it decode-probes ONLY when the model is already resident).
@@ -133,6 +149,7 @@ def probe_node(n: dict) -> dict:
         "served_model": served, "max_context": n["max_context"],
         "latency_class": n["latency_class"], "free_slots": n["free_slots"],
         "epoch": n["epoch"], "alive": alive, "probe_ms": probe_ms, "note": note,
+        "probe_verified": not n.get("lease_active", False),
         # RFC 0002: the pull driver carries the MEASURED gpu_uuid (from nvidia-smi,
         # local or cross-host SSH) but leaves boot_epoch NULL — an HTTP/SSH probe has
         # no boot identity to stamp, so the ratchet stays inert for pull-driven rows.
@@ -154,6 +171,7 @@ def _failed_row(n: dict, exc: Exception) -> dict:
         "max_context": n.get("max_context"), "latency_class": n.get("latency_class"),
         "free_slots": n.get("free_slots"), "epoch": n.get("epoch"),
         "alive": False, "probe_ms": None, "note": f"probe crashed: {exc}",
+        "probe_verified": True,
         # NOT alive -> the UPSERT zeroes the streak / re-quarantines; a NULL uuid here
         # COALESCE-preserves any known identity, and boot_epoch stays inert (pull).
         # RFC 0005 (F-KEYS): mig_mode/ecc_mode None (a crashed probe knows no capability;

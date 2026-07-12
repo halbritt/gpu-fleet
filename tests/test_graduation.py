@@ -67,6 +67,7 @@ class FakeRegistryDB:
                 "boot_epoch": p.get("boot_epoch"),
                 "alive": p["alive"],
                 "probe_ms": p.get("probe_ms"),
+                "loaded_model": p.get("loaded_model"),
                 "served_model": p.get("served_model"),
                 "vram_free_mib": p.get("vram_free"),
                 "note": p.get("note"),
@@ -84,6 +85,8 @@ class FakeRegistryDB:
         # probe_streak CASE (reads the OLD streak, exactly like the SQL RHS).
         if not p["alive"]:
             streak = 0
+        elif not p.get("probe_verified", True):
+            streak = self.n - 1 if old["status"] == "routable" else old["probe_streak"]
         elif uuid_changed:
             streak = 1
         else:
@@ -91,6 +94,8 @@ class FakeRegistryDB:
         # status CASE (also reads the OLD streak/status).
         if not p["alive"]:
             status = "unverified"
+        elif not p.get("probe_verified", True):
+            status = "probationary" if old["status"] == "routable" else old["status"]
         elif uuid_changed:
             status = "unverified"
         elif old["status"] == "routable":
@@ -104,7 +109,12 @@ class FakeRegistryDB:
         old["probe_streak"] = streak
         old["status"] = status
         old["alive"] = p["alive"]
-        old["probe_ms"] = p.get("probe_ms")
+        if p.get("probe_verified", True):
+            old["probe_ms"] = p.get("probe_ms")
+            old["loaded_model"] = p.get("loaded_model")
+        elif not p["alive"]:
+            old["probe_ms"] = p.get("probe_ms")
+            old["loaded_model"] = None
         old["served_model"] = p.get("served_model")
         old["vram_free_mib"] = p.get("vram_free")
         old["note"] = p.get("note")
@@ -115,7 +125,7 @@ NODE, URL = "n", "http://n:8081/v1"
 
 
 def _row(alive=True, *, gpu_uuid="U1", boot_epoch=None, served_model="m",
-         vram_free=24000, probe_ms=10, note=None):
+         vram_free=24000, probe_ms=10, note=None, probe_verified=True):
     """A full heartbeat.UPSERT param row (every %(...)s key the SQL names)."""
     return {
         "node": NODE, "endpoint": URL, "slot_id": 0,
@@ -123,6 +133,7 @@ def _row(alive=True, *, gpu_uuid="U1", boot_epoch=None, served_model="m",
         "vram_free": vram_free, "util": 5, "loaded_model": served_model if alive else None,
         "served_model": served_model, "max_context": 8192, "latency_class": "batch",
         "free_slots": 1, "epoch": 0, "alive": alive, "probe_ms": probe_ms, "note": note,
+        "probe_verified": probe_verified,
         "gpu_uuid": gpu_uuid, "boot_epoch": boot_epoch,
     }
 
@@ -147,6 +158,28 @@ def test_streak_promotes_after_N_and_demotes_on_break():
     # A broken streak demotes back to unverified the instant a probe fails.
     r = _tick(db, alive=False)
     assert r["status"] == "unverified" and r["probe_streak"] == 0
+
+
+def test_lease_time_gpu_checks_cannot_promote_without_a_decode():
+    db = FakeRegistryDB()
+    for _ in range(GRAD):
+        _tick(db, probe_ms=10)
+
+    weak = _tick(db, probe_ms=None, probe_verified=False)
+    assert weak["alive"] is True
+    assert weak["status"] == "probationary"
+    assert weak["probe_streak"] == GRAD - 1
+    assert weak["probe_ms"] == 10
+    assert weak["loaded_model"] == "m"
+
+    still_weak = _tick(db, probe_ms=None, probe_verified=False)
+    assert still_weak["status"] == "probationary"
+    assert still_weak["probe_streak"] == GRAD - 1
+
+    verified = _tick(db, probe_ms=12, probe_verified=True)
+    assert verified["status"] == "routable"
+    assert verified["probe_streak"] == GRAD
+    assert verified["probe_ms"] == 12
 
 
 # --------------------------------------------------------------------------- #

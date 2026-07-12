@@ -79,6 +79,7 @@ def _hb_row(**over):
         "loaded_model": "llama-3", "served_model": "llama-3", "max_context": 8192,
         "latency_class": "batch", "free_slots": 1, "epoch": 0,
         "alive": True, "probe_ms": 12, "note": None,
+        "probe_verified": True,
         # RFC 0002 columns the revised UPSERT writes; pull-style defaults (boot_epoch
         # NULL => ratchet inert, gpu_uuid NULL => identity unknown) keep these epoch
         # tests focused on `epoch`, not the quarantine ratchet.
