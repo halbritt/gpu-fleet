@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Run one arbitrary command under an exact-model gpu-fleet lease.
+set -uo pipefail
+FLEET=/home/halbritt/git/gpu-fleet
+exec python3 "$FLEET/lease_run.py" "$@"

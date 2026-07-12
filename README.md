@@ -58,7 +58,23 @@ python3 heartbeat.py --node peecee --endpoint http://peecee:11434/v1 \
 
 # a consumer claims slots by capability (di fan-out width K):
 python3 pick_slot.py --latency-class batch -k 4 --json
+
+# run one arbitrary command while holding an exact-model lease. The two tokens
+# are replaced directly in argv (no shell evaluation); GPU_FLEET_* metadata is
+# also exported to the child process.
+bin/gpu-fleet-run --model qwen3.6-35b-a3b --max-context 32768 --job trial-01 -- \
+    python3 -c 'import sys; print(sys.argv[1:])' \
+    @@GPU_FLEET_SERVED_MODEL@@ @@GPU_FLEET_ENDPOINT_URL@@
 ```
+
+`gpu-fleet-run` picks and claims in one transaction, renews every 15 seconds,
+and releases when the child exits. Lease loss or a registry error is fail-closed:
+the child's process group is stopped before the fenced release, and the runner
+exits 75. There is no direct-endpoint fallback or automatic replay. Child exit
+codes are otherwise preserved (signal exits use `128 + signal`); a caller-set
+timeout exits 124. As with the fleet's existing client-side deadman, uncatchable
+runner death cannot run cleanup: the lease record expires after 45 seconds, but
+`SIGKILL` can leave child processes behind for an operator to reap.
 
 ## Install (autonomous — no human intervention)
 
@@ -72,6 +88,7 @@ systemctl --user daemon-reload && systemctl --user enable --now gpu-fleet-heartb
 
 # di auto-routes onto a live batch slot (no manual endpoint):
 cp bin/di-fleet ~/.local/bin/ && chmod +x ~/.local/bin/di-fleet
+cp bin/gpu-fleet-run ~/.local/bin/ && chmod +x ~/.local/bin/gpu-fleet-run
 di-fleet "your problem" --json
 ```
 
