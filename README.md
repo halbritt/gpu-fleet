@@ -106,6 +106,10 @@ It is live on the next heartbeat tick; a node that goes silent (probe fails) age
 out of `live_slots` automatically. An agent or a node's boot-time join-script does
 this insert — the human is out of the loop.
 
+Windows nodes are pull-only (RFC 0002) — the full onboarding process (PowerShell +
+OpenSSH remote management, probe-mode choice, measurement discipline, the join
+migration) is in [docs/adding-a-windows-node.md](docs/adding-a-windows-node.md).
+
 ## Scope — done vs later
 
 **v1 spine (done):** directory table, decode-probe heartbeat, capability `pick`
