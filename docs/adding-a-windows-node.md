@@ -33,52 +33,18 @@ serving stack, and PowerShell 7 + OpenSSH Server for management + the
 
 ### 2a. Remote management: PowerShell 7 + OpenSSH Server
 
-All of this runs in one **elevated** PowerShell session at the console (the
-last time you need physical/RDP access).
+Full standalone runbook (one elevated console session, key-auth ACL trap,
+pwsh-default-shell gotchas, verification, troubleshooting):
+**[windows-remote-management.md](windows-remote-management.md)**.
 
-```powershell
-# PowerShell 7 (pwsh) — the management shell
-winget install --id Microsoft.PowerShell --source winget
+The acceptance test, from the puller host:
 
-# OpenSSH Server — built-in Windows optional capability
-Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
-Set-Service -Name sshd -StartupType Automatic
-Start-Service sshd
-
-# The capability install creates firewall rule 'OpenSSH-Server-In-TCP'; verify:
-Get-NetFirewallRule -Name '*OpenSSH-Server*' | Enable-NetFirewallRule
-
-# Make pwsh the default shell for incoming SSH sessions
-New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell `
-  -Value 'C:\Program Files\PowerShell\7\pwsh.exe' -PropertyType String -Force
-
-# A fleet node must not sleep out from under its SSH server
-powercfg /change standby-timeout-ac 0
+```bash
+ssh -o BatchMode=yes <node> nvidia-smi   # no prompt, well under the 10s probe timeout
 ```
 
-Key auth — for an **administrator** account, Windows sshd reads
-`C:\ProgramData\ssh\administrators_authorized_keys` (NOT the per-user
-`~\.ssh\authorized_keys`), and it must have a locked-down ACL or sshd ignores
-it:
-
-```powershell
-Add-Content -Path C:\ProgramData\ssh\administrators_authorized_keys `
-  -Value '<puller host pubkey line, e.g. contents of proximal ~/.ssh/id_ed25519.pub>'
-icacls.exe C:\ProgramData\ssh\administrators_authorized_keys `
-  /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F'
-```
-
-Once key login works, optionally set `PasswordAuthentication no` in
-`C:\ProgramData\ssh\sshd_config` and `Restart-Service sshd`.
-
-⚠️ **PowerShell-as-default-shell gotcha** (the "fragile peecee PowerShell path"
-RFC 0002 mentions): remote commands are parsed by pwsh, not a POSIX sh —
-`2>/dev/null` fails (pwsh has `2>$null`), and quoting rules differ. Keep any
-`gpu_cmd` a bare command with no shell-isms; the standard
-`ssh -o BatchMode=yes <node> nvidia-smi` is safe under either shell.
-
-`nvidia-smi` ships in `C:\Windows\System32` with modern drivers, so it is on
-PATH for SSH sessions automatically.
+That command is exactly what the heartbeat driver runs as `gpu_cmd` every
+tick; until it passes, the node can never go live.
 
 ### 2b. Serving stack
 
