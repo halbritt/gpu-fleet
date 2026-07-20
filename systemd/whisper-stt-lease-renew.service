@@ -1,0 +1,25 @@
+# Companion renew loop for whisper-stt's standing gpu-fleet lease (RFC 0006).
+# whisper-stt.service acquires in ExecStartPre and releases in ExecStopPost; a
+# 45s-TTL lease held for hours needs a renewer, and a Type=simple unit has no
+# second long-running Exec — so the loop is its own unit, bound to whisper-stt's
+# lifetime. It re-reads the state file every tick (no coordination with acquire
+# needed) and restores coverage after any gap; it never kills whisper-stt.
+#
+# Install: /etc/systemd/system/whisper-stt-lease-renew.service
+# then: sudo systemctl daemon-reload && sudo systemctl enable whisper-stt-lease-renew
+# (enable creates whisper-stt.service.wants/ so it starts/stops WITH whisper-stt)
+
+[Unit]
+Description=gpu-fleet lease renew loop for whisper-stt (keeps the STT-hot skip signal live)
+BindsTo=whisper-stt.service
+After=whisper-stt.service
+
+[Service]
+Type=simple
+User=halbritt
+ExecStart=/home/halbritt/git/gpu-fleet/bin/whisper-stt-lease renew-loop
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=whisper-stt.service

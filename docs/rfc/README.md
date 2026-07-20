@@ -12,6 +12,7 @@ one RFC per chain. Each RFC carries a **falsifiable gate** for the verify stage.
 | [0003](0003-stale-router-epoch-fencing.md) | Stale-router epoch fencing | **Shipped** (migration 008) | `epoch` reject hook |
 | [0004](0004-quad-server-nvlink-onboarding.md) | Quad-server NVLink onboarding | Stub — **blocked (hardware)** | NVLink TP domains |
 | [0005](0005-exporter-capacity-signal.md) | Exporter-fed capacity signal (probe-anchored) | Draft — ready | richer capacity signal |
+| [0006](0006-whisper-stt-lease-holder.md) | whisper-STT as a standing exclusive lease-holder | **Shipped** (`whisper_lease.py`) | Plane GPUFLE-1 |
 
 ## Dependency / build order
 

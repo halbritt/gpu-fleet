@@ -80,6 +80,17 @@ timeout exits 124. As with the fleet's existing client-side deadman, uncatchable
 runner death cannot run cleanup: the lease record expires after 45 seconds, but
 `SIGKILL` can leave child processes behind for an operator to reap.
 
+`whisper-stt-lease` ([RFC 0006](docs/rfc/0006-whisper-stt-lease-holder.md)) is
+the standing-SERVICE counterpart: `whisper-stt.service` on proximal holds an
+exclusive lease on its own llama slot row for as long as STT is hot (ExecStartPre
+acquire / companion renew unit / ExecStopPost release, `systemd/`), so the
+whisper-vs-llama OOM collision on the shared 3090 becomes a scheduling skip in
+both directions — `pick` skips the leased slot, and a whisper start under a live
+fleet lease defers (exit 75, systemd retries) until it drains. Unlike
+`gpu-fleet-run` it degrades OPEN when the registry cannot offer the slot at all:
+praxis's voice intake is never hostage to a dark registry, which is collision-safe
+because fleet consumers can only be scheduled through that same registry.
+
 ## Install (autonomous — no human intervention)
 
 ```bash

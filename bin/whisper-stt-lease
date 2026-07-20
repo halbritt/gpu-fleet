@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# whisper-stt-lease: hold a standing exclusive gpu-fleet lease for whisper-stt.
+# Thin wrapper — acquire/renew-loop/release logic lives in whisper_lease.py so it
+# is importable + unit-testable. Wired into whisper-stt.service (ExecStartPre /
+# ExecStopPost) plus the whisper-stt-lease-renew companion unit (see systemd/).
+set -uo pipefail
+FLEET=/home/halbritt/git/gpu-fleet
+exec python3 "$FLEET/whisper_lease.py" "$@"
