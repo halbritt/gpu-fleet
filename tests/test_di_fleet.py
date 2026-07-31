@@ -365,6 +365,35 @@ def test_failed_renew_aborts_shard():
     assert ops.released == ["L1"]
 
 
+def test_renew_exception_aborts_shard_before_propagating_registry_error():
+    child = FakeChild(runs_forever=True)
+
+    class _Ops:
+        def __init__(self):
+            self.released = []
+
+        def claim(self, conn, slot, holder, *, ttl_seconds=45, model_mib=0, max_context=None):
+            return "L1"
+
+        def renew(self, conn, lease_id, *, ttl_seconds=45):
+            raise ConnectionError("registry disappeared")
+
+        def release(self, conn, lease_id):
+            self.released.append(lease_id)
+            raise ConnectionError("release also failed")
+
+    ops = _Ops()
+    with pytest.raises(ConnectionError, match="registry disappeared") as caught:
+        df.run_leased_shard(
+            {"endpoint_url": "http://x:8081/v1"}, 1, [], holder="A",
+            conn_factory=lambda: None, lease_ops=ops,
+            child_factory=lambda *a: child, renew_seconds=1, sleep=lambda _s: None)
+
+    assert child.terminated is True
+    assert ops.released == ["L1"]
+    assert caught.value.__notes__ == ["lease release failed: release also failed"]
+
+
 def test_run_leased_shard_raises_when_slot_cannot_be_claimed():
     # No lease -> no GPU work: the child is never even launched.
     slot = {"node": "n", "endpoint_url": "http://busy:8081/v1", "slot_id": 0}
@@ -656,3 +685,14 @@ def test_no_engine_import_in_reader():
     # the di boundary stays a SUBPROCESS (the child is launched via node, never imported).
     assert "subprocess" in inspect.getsource(df)
     assert "node" in inspect.getsource(df._popen_child)
+
+
+def test_main_refuses_unleased_local_fallback_when_no_slot_is_claimable(monkeypatch, capsys):
+    exec_calls = []
+    monkeypatch.setattr(df, "route_slots", lambda *args, **kwargs: [])
+    monkeypatch.setattr(df, "_resolve_max_context", lambda *args, **kwargs: None)
+    monkeypatch.setattr(df.os, "execvp", lambda *args: exec_calls.append(args))
+
+    assert df.main([]) == 75
+    assert exec_calls == []
+    assert "no claimable fleet slot" in capsys.readouterr().err

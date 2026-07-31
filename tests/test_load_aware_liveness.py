@@ -115,7 +115,7 @@ def test_gate_heartbeat_never_forces_a_load():
         assert decode.calls == 0, f"heartbeat forced a load at free={free}MiB"
 
 
-# --- threshold fallback: min_load_vram_mib NULL => default / 95% of total -----
+# --- threshold fallback: min_load_vram_mib NULL => flat 21000 MiB default -----
 
 def test_null_threshold_falls_back_to_default():
     # NULL threshold => flat DEFAULT_MIN_LOAD_VRAM_MIB (21000); no card-fraction

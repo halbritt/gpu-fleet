@@ -84,7 +84,7 @@ DEFAULT_STATE = os.path.expanduser("~/.local/state/gpu-fleet/whisper-stt-lease.j
 # The claim itself remains the only arbiter of exclusivity.
 SLOT_ROW_SQL = """
 SELECT alive,
-       heartbeat_ts > now() - interval '45 seconds' AS fresh,
+       gpu_slot_is_fresh(heartbeat_ts) AS fresh,
        status,
        vram_free_mib,
        lease_id,

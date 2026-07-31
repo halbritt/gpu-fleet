@@ -2,7 +2,7 @@
 """gpu-fleet heartbeat: publish one node's GPU slot into the registry.
 
 Reads local GPU stats via nvidia-smi (or a remote `--gpu-cmd` like
-`ssh peecee nvidia-smi`), runs a real 2-token decode-probe against the node's
+`ssh peecee nvidia-smi`), runs a real 1-token decode-probe against the node's
 OpenAI-compatible endpoint, and UPSERTs the `gpu_slots` row. Pure stdlib +
 psycopg. Run as a node's own loop, or proximal-driven for a node that can't yet
 self-heartbeat (e.g. the Windows desktop until it runs its own).
@@ -634,7 +634,19 @@ def heartbeat_once(conn: psycopg.Connection, args) -> dict:
         "mig_mode": stats.get("mig_mode"), "ecc_mode": stats.get("ecc_mode"),
         "boot_epoch": next_boot_epoch() if push else None,
     }
-    conn.execute(UPSERT, row)
+    heartbeat_write = conn.execute(UPSERT, row)
+    if heartbeat_write.rowcount == 0:
+        # A stale/equal push identity lost the boot_epoch ratchet. Roll back the
+        # earlier driver-lease CAS too: a writer whose liveness row was refused
+        # must not keep the puller fenced or refresh companion capacity.
+        conn.rollback()
+        return {
+            "node": args.node,
+            "alive": False,
+            "probe_ms": None,
+            "vram_free_mib": stats.get("vram_free_mib"),
+            "note": "heartbeat rejected by boot_epoch ratchet",
+        }
     # RFC 0005 (Slice 1+2): write the companion capacity row AFTER the liveness UPSERT,
     # under the savepoint guard (C3), BEFORE the commit — so a malformed capacity write
     # never sinks liveness. Best-effort enrichment; the return value is intentionally
@@ -644,6 +656,32 @@ def heartbeat_once(conn: psycopg.Connection, args) -> dict:
     conn.commit()
     return {"node": args.node, "alive": alive, "probe_ms": probe_ms,
             "vram_free_mib": stats.get("vram_free_mib"), "note": note}
+
+
+def heartbeat_loop(conn, args, *, heartbeat_fn=heartbeat_once, sleep=time.sleep,
+                   iterations=None) -> int:
+    ticks = 0
+    while iterations is None or ticks < iterations:
+        failed = False
+        try:
+            result = heartbeat_fn(conn, args)
+        except Exception as exc:
+            conn.rollback()
+            failed = True
+            result = {
+                "node": args.node,
+                "alive": False,
+                "probe_ms": None,
+                "vram_free_mib": None,
+                "note": f"heartbeat tick failed: {exc}",
+            }
+        print(json.dumps(result))
+        ticks += 1
+        if not args.interval:
+            return 1 if failed else 0
+        if iterations is None or ticks < iterations:
+            sleep(args.interval)
+    return 0
 
 
 def main() -> int:
@@ -661,7 +699,7 @@ def main() -> int:
     p.add_argument("--slot-id", type=int, default=0)
     p.add_argument("--min-load-vram-mib", type=int, default=None,
                    help="for probe_model=ollama-ondemand: free VRAM needed to call "
-                        "the model loadable (default: 23000 or 95%% of total)")
+                        "the model loadable (default: 21000 MiB)")
     p.add_argument("--epoch", type=int, default=0)
     p.add_argument("--push", action="store_true",
                    help="RFC 0002 push mode (trusted node self-reporting): stamp a "
@@ -675,12 +713,7 @@ def main() -> int:
     args.probe_model = args.probe_model or args.served_model
 
     with psycopg.connect(args.db, autocommit=False) as conn:
-        while True:
-            result = heartbeat_once(conn, args)
-            print(json.dumps(result))
-            if not args.interval:
-                return 0
-            time.sleep(args.interval)
+        return heartbeat_loop(conn, args)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ the guarded tests in test_epoch_pg.py.
 """
 
 import json
+import types
 import urllib.error
 
 import heartbeat
@@ -110,3 +111,33 @@ def test_successful_rediscovery_updates_the_sticky_value(monkeypatch):
     assert heartbeat.discover_served_model(ep, "fallback") == "llama-3"
     state["id"] = "mistral"  # the node really swapped models
     assert heartbeat.discover_served_model(ep, "fallback") == "mistral"
+
+
+def test_interval_loop_contains_one_tick_failure_and_continues(capsys):
+    class Conn:
+        def __init__(self):
+            self.rollbacks = 0
+
+        def rollback(self):
+            self.rollbacks += 1
+
+    calls = 0
+
+    def flaky_tick(conn, args):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ValueError("nvidia-smi emitted N/A")
+        return {"node": args.node, "alive": True, "note": None}
+
+    conn = Conn()
+    args = types.SimpleNamespace(node="n", interval=1)
+    assert heartbeat.heartbeat_loop(
+        conn, args, heartbeat_fn=flaky_tick, sleep=lambda _: None, iterations=2) == 0
+
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert calls == 2
+    assert conn.rollbacks == 1
+    assert lines[0]["alive"] is False
+    assert "nvidia-smi emitted N/A" in lines[0]["note"]
+    assert lines[1]["alive"] is True

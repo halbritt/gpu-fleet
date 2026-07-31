@@ -48,7 +48,10 @@ single point of failure.
 ## Usage
 
 ```bash
-psql -d gpu_fleet -f migrations/001_gpu_slots.sql      # apply
+# Fresh database: apply the complete migration chain in lexical order.
+for migration in migrations/[0-9][0-9][0-9]_*.sql; do
+    psql -v ON_ERROR_STOP=1 -d gpu_fleet -f "$migration" || exit
+done
 
 # a node heartbeats itself (interactive, local nvidia-smi):
 python3 heartbeat.py --node proximal --endpoint http://localhost:8081/v1 \
@@ -57,7 +60,8 @@ python3 heartbeat.py --node proximal --endpoint http://localhost:8081/v1 \
 
 # proximal-driven heartbeat for a node that can't self-report yet (Windows desktop):
 python3 heartbeat.py --node peecee --endpoint http://peecee:11434/v1 \
-    --served-model qwen3-vl:8b --latency-class batch --max-context 32768 \
+    --served-model qwen3-vl:8b --probe-model ollama-ondemand \
+    --latency-class batch --max-context 32768 \
     --gpu-cmd "ssh -o BatchMode=yes peecee nvidia-smi"
 
 # a consumer claims slots by capability (di fan-out width K):
@@ -80,6 +84,9 @@ timeout exits 124. As with the fleet's existing client-side deadman, uncatchable
 runner death cannot run cleanup: the lease record expires after 45 seconds, but
 `SIGKILL` can leave child processes behind for an operator to reap.
 
+`di-fleet` uses the same lease requirement. If no slot can be claimed, it
+refuses an unleased localhost fallback and exits 75.
+
 `whisper-stt-lease` ([RFC 0006](docs/rfc/0006-whisper-stt-lease-holder.md)) is
 the standing-SERVICE counterpart: `whisper-stt.service` on proximal holds an
 exclusive lease on its own llama slot row for as long as STT is hot (ExecStartPre
@@ -94,8 +101,10 @@ because fleet consumers can only be scheduled through that same registry.
 ## Install (autonomous — no human intervention)
 
 ```bash
-psql -d gpu_fleet -f migrations/001_gpu_slots.sql
-psql -d gpu_fleet -f migrations/002_fleet_nodes.sql       # declares the fleet members
+# Fresh database only. Existing installations apply only new migrations.
+for migration in migrations/[0-9][0-9][0-9]_*.sql; do
+    psql -v ON_ERROR_STOP=1 -d gpu_fleet -f "$migration" || exit
+done
 
 # heartbeat driver as a self-restarting user service (survives reboot via linger):
 cp systemd/gpu-fleet-heartbeat.service ~/.config/systemd/user/
@@ -107,15 +116,16 @@ cp bin/gpu-fleet-run ~/.local/bin/ && chmod +x ~/.local/bin/gpu-fleet-run
 di-fleet "your problem" --json
 ```
 
-**Growing the fleet needs no code change** — insert a row:
+Declare a pull-driven node with the next append-only migration, not a live
+one-off `UPDATE` or `INSERT`:
 ```sql
 INSERT INTO fleet_nodes (node, endpoint_url, served_model, latency_class, gpu_cmd, max_context, nvlink_domain)
 VALUES ('quad-a', 'http://quad:8081/v1', 'qwen3.6-35b-a3b', 'batch',
         'ssh -o BatchMode=yes quad nvidia-smi', 262144, 'quad-pair-0');
 ```
-It is live on the next heartbeat tick; a node that goes silent (probe fails) ages
-out of `live_slots` automatically. An agent or a node's boot-time join-script does
-this insert — the human is out of the loop.
+After that migration is applied, the puller measures the node on its next tick.
+A trusted push node can instead self-register through its first heartbeat. A
+node that goes silent ages out of `live_slots` automatically.
 
 Windows nodes are pull-only (RFC 0002) — the full onboarding process (PowerShell +
 OpenSSH remote management, probe-mode choice, measurement discipline, the join
@@ -137,15 +147,18 @@ headroom to load it on demand, NOT-LOADABLE — aged out of `live_slots` — whe
 marker owns the GPU; so di never routes to a peecee that can't actually serve and
 the heartbeat never force-loads a model onto a shared card).
 
-**v2 (done — driven through striatum design→build→verify, one RFC per chain):**
+**v2 implemented core (see the [RFC status manifest](docs/rfc/README.md) for
+deferred slices):**
 
 - **Exclusive slot leases** ([RFC 0001](docs/rfc/0001-exclusive-slot-leases.md),
   migration 007). K-fan-out claims are exclusive, not advisory: a slot is held by
   exactly one consumer for a self-renewing 45 s TTL evaluated entirely by Postgres;
   **capacity is derived** from live leases (no mutable counter, no reaper); a
   crashed consumer's lease expires autonomously and a zombie is fenced by
-  `lease_id`. `di-fleet` claims/renews/releases per shard and **terminates the
-  in-flight `di` child on lease loss** before any second consumer can use the GPU.
+  `lease_id`. `di-fleet` claims/renews/releases per shard and terminates its
+  in-flight child as soon as a failed renew or registry exception is observed.
+  This client-side deadman does not create a hard happens-before edge against a
+  successor claim.
 - **Stale-router epoch fencing** ([RFC 0003](docs/rfc/0003-stale-router-epoch-fencing.md),
   migration 008). A slot bumps `epoch` on a routing-relevant change
   (`served_model`/`endpoint_url`/`max_context`/`nvlink_domain`); a holder's lease
@@ -162,6 +175,15 @@ the heartbeat never force-loads a model onto a shared card).
   drive the fleet, removing the proximal SSH-driver SPOF; a per-boot monotonic
   `boot_epoch` ratchet refuses replayed/split-brain writes. Routing reads
   `routable_slots`.
+- **Probe-anchored capacity** ([RFC 0005](docs/rfc/0005-exporter-capacity-signal.md),
+  migration 010). The companion schema, freshness decay, request-aware pick and
+  claim predicates, writer isolation, and test seams ship. Production exporter
+  and per-PID collectors are not wired; absent telemetry degrades to the legacy
+  measured slot value.
+- **Declaration versus measurement boundary**
+  ([ADR 0001](docs/adr/0001-declaration-measurement-boundary.md)). Owner intent
+  stays declared, observations stay measured, and observers do not manufacture
+  leases.
 
 **Next:**
 
@@ -171,10 +193,7 @@ the heartbeat never force-loads a model onto a shared card).
 - **Multi-node puller deploy** — run the (already-shipped) peer-runnable driver on
   ≥ 2 Linux nodes, with push opt-in for the trusted quad-server, to operationally
   retire the proximal SSH SPOF. Waits on a second Linux node.
-- **Richer capacity signal from the nvidia exporter** — feed VRAM/util/topology
-  from the Prometheus GPU exporters into the same rows
-  ([RFC 0005](docs/rfc/0005-exporter-capacity-signal.md)).
-- **Deferred follow-ups** — tracked as GitHub issues (soft-reservation herd flag;
+- **Deferred follow-ups** — tracked in Plane project `GPUFLE` (soft-reservation herd flag;
   `capacity>1` `slot_leases` table; HTTP-only peecee liveness; EWMA trust score;
   deeper periodic canary probe; contract migration to drop `free_slots`).
 

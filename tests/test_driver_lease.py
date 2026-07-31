@@ -51,17 +51,18 @@ def test_node_lease_cas_freshness_is_db_now():
 
 # --------------------------------------------------------------------------- #
 # BC1 (non-gating composition) — registration = first heartbeat. The push path's lease
-# CAS is a bare coordination signal whose result is NEVER captured/branched on, and the
-# UPSERT runs UNCONDITIONALLY. (The composed register+graduate behavior for a node with
+# CAS is a bare coordination signal whose result is NEVER captured/branched on. The
+# UPSERT result is captured only to detect a boot-epoch ratchet rejection, and the UPSERT
+# still runs UNCONDITIONALLY. (The composed register+graduate behavior for a node with
 # NO fleet_nodes row is proven against Postgres in test_lifecycle_pg.py test D.)
 # --------------------------------------------------------------------------- #
 def test_push_lease_cas_does_not_gate_the_upsert():
     src = inspect.getsource(heartbeat.heartbeat_once)
     assert "conn.execute(NODE_LEASE_CAS" in src
     assert "= conn.execute(NODE_LEASE_CAS" not in src, "the CAS result must not gate the write"
-    assert "conn.execute(UPSERT, row)" in src
+    assert "heartbeat_write = conn.execute(UPSERT, row)" in src
     # the UPSERT is at function indent (unconditional), not nested under an `if` on the CAS.
-    assert "\n    conn.execute(UPSERT, row)" in src
+    assert "\n    heartbeat_write = conn.execute(UPSERT, row)" in src
 
 
 # --------------------------------------------------------------------------- #

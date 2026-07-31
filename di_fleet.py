@@ -40,7 +40,6 @@ real subprocess, DB, or HTTP.
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import socket
@@ -57,6 +56,7 @@ DI_CLI = os.environ.get(
 # several round-trips per branch, so a shard with a handful of frames can take a
 # while; this just stops a black-hole slot from hanging the whole run forever.
 SHARD_TIMEOUT = float(os.environ.get("DI_FLEET_SHARD_TIMEOUT", "1200"))
+EX_TEMPFAIL = 75
 
 
 # =========================================================================== #
@@ -81,8 +81,8 @@ SHARD_TIMEOUT = float(os.environ.get("DI_FLEET_SHARD_TIMEOUT", "1200"))
 # but not a new top-level leases.py — see CLAIM_LEDGER.
 # =========================================================================== #
 
-# TTL aligned with the heartbeat TTL (gpu_slots live window is 45s) so the two
-# timers fold into one liveness fact; renew at TTL/3 so two missed renewals still
+# TTL aligned with gpu_fleet_heartbeat_ttl() so the two timers fold into one
+# liveness fact; renew at TTL/3 so two missed renewals still
 # leave margin before expiry.
 TTL_SECONDS = 45
 RENEW_SECONDS = 15  # TTL/3
@@ -113,7 +113,7 @@ UPDATE gpu_slots
        lease_epoch   = epoch
  WHERE (node, endpoint_url, slot_id) = (%(node)s, %(endpoint_url)s, %(slot_id)s)
    AND alive
-   AND heartbeat_ts > now() - interval '45 seconds'
+   AND gpu_slot_is_fresh(heartbeat_ts)
    AND status = 'routable'
    AND COALESCE(
          (SELECT CASE WHEN c.capacity_source = 'measured'
@@ -150,12 +150,12 @@ RETURNING lease_id
 #     NULL arm keeps a pre-Slice-D in-flight lease (lease_epoch never stamped)
 #     un-fenced for its one remaining TTL during the rollout drain (BC3 — DO NOT
 #     remove it; removing it would evict every in-flight lease at deploy).
-#   * alive AND heartbeat_ts within the SAME 45s live_slots window (BC2): the leased
+#   * alive AND heartbeat_ts within the SAME registry freshness window (BC2): the leased
 #     (node, endpoint_url, slot_id) row must still be the live, FRESH heartbeated
 #     endpoint. When the node turns over to a new endpoint_url (a new PK row), the
-#     old leased row stops being heartbeated, ages out of the 45s window, and this
+#     old leased row stops being heartbeated, ages out of the freshness window, and this
 #     held lease's renew returns zero rows instead of renewing against a stale row.
-#     Reuses the 45s window verbatim (NOT tighter) so a transient heartbeat-driver
+#     Reuses the registry window verbatim (NOT tighter) so a transient heartbeat-driver
 #     outage does not fence every live lease.
 # The consumer's existing renew()==False => abort child + drop slot + re-pick path
 # (_monitor, BC1-A) handles all of these unchanged; it just gains more reasons to
@@ -167,7 +167,7 @@ UPDATE gpu_slots
    AND now() < lease_expires
    AND (lease_epoch IS NULL OR epoch = lease_epoch)
    AND alive
-   AND heartbeat_ts > now() - interval '45 seconds'
+   AND gpu_slot_is_fresh(heartbeat_ts)
 RETURNING lease_id
 """
 
@@ -286,8 +286,8 @@ def route_slots(k, db="dbname=gpu_fleet", latency_class=None, pick_fn=None,
     killing the fan-out. So fetch a generous margin and trim to `k` AFTER filtering.
 
     `pick_fn(fetch_k) -> rows` is injectable so the routing policy is unit-testable
-    without a DB. Any failure to reach the registry degrades to "no slots" (di's own
-    default), never an exception."""
+    without a DB. Any failure to reach the registry becomes "no claimable slots";
+    main then exits 75 rather than bypassing the lease protocol."""
     fetch_k = max(k + 8, 16)  # margin so non-LLM rows can't crowd out real LLM slots
     if pick_fn is None:
         def pick_fn(n, max_context=None):
@@ -301,8 +301,8 @@ def route_slots(k, db="dbname=gpu_fleet", latency_class=None, pick_fn=None,
     # production never populates would NOT satisfy the gate).
     try:
         picks = pick_fn(fetch_k, max_context=max_context)
-    except Exception as exc:  # no DB, no psycopg, query error -> degrade to di default
-        print(f"di-fleet: registry unreachable ({exc}); using di default", file=sys.stderr)
+    except Exception as exc:  # no DB, no psycopg, or query error
+        print(f"di-fleet: registry unreachable ({exc})", file=sys.stderr)
         return []
     return _filter_llm_slots(picks)[:k]
 
@@ -476,7 +476,12 @@ def _monitor(conn, slot, child, lease_id, *, lease_ops, ttl_seconds, renew_secon
         sleep(renew_seconds)
         if child.poll() is not None:
             break  # child finished during the renew interval
-        if not lease_ops.renew(conn, lease_id, ttl_seconds=ttl_seconds):
+        try:
+            renewed = lease_ops.renew(conn, lease_id, ttl_seconds=ttl_seconds)
+        except Exception:
+            _terminate(child)
+            raise
+        if not renewed:
             # BC1-A: lease lost — abort the child HERE, synchronously, in the same
             # path that observed the failed renew. No later poll, no flag.
             _terminate(child)
@@ -514,8 +519,11 @@ def _run_and_settle(conn, slot, lease_id, frames, flags, *, holder, lease_ops,
         if release_on_death:
             lease_ops.release(conn, lease_id)
         raise
-    except BaseException:
-        lease_ops.release(conn, lease_id)
+    except BaseException as error:
+        try:
+            lease_ops.release(conn, lease_id)
+        except Exception as release_error:
+            error.add_note(f"lease release failed: {release_error}")
         raise
     else:
         lease_ops.release(conn, lease_id)
@@ -895,22 +903,27 @@ def _split_argv(argv):
     while i < len(argv):
         a = argv[i]
         if a == "--frames":
-            frames = int(argv[i + 1]); i += 2
+            frames = int(argv[i + 1])
+            i += 2
         elif a == "--top":
             top = int(argv[i + 1])
             rest += [a, argv[i + 1]]  # --top still passes through to each shard
             i += 2
         elif a == "--json":
-            want_json = True; i += 1
+            want_json = True
+            i += 1
         elif a == "-k" or a == "--slots":
-            k = int(argv[i + 1]); i += 2  # di-fleet-only: fan-out width override
+            k = int(argv[i + 1])
+            i += 2  # di-fleet-only: fan-out width override
         elif a == "--max-context":
-            max_context = int(argv[i + 1]); i += 2  # di-fleet-owned: request headroom (BC1)
+            max_context = int(argv[i + 1])
+            i += 2  # di-fleet-owned: request headroom (BC1)
         elif a == "--model":
             rest += [a, argv[i + 1]]  # PEEK: child still gets --model; not threaded
             i += 2
         else:
-            rest.append(a); i += 1
+            rest.append(a)
+            i += 1
     return frames, top, want_json, k, max_context, rest
 
 
@@ -971,16 +984,12 @@ def main(argv=None):
     max_context = _resolve_max_context(max_context_flag, db)
     slots = route_slots(k, db=db, max_context=max_context)
 
-    # No live fleet slot -> single di on its own localhost default (today's
-    # behavior). Nothing to lease, so we exec and pass frames through unchanged.
+    # A fleet consumer must never bypass the lease protocol. An empty route can
+    # mean every fitting slot is legitimately held by another consumer.
     if not slots:
-        print("di-fleet: no live fleet slot; using di defaults (localhost:8081)",
+        print("di-fleet: no claimable fleet slot; refusing unleased local fallback",
               file=sys.stderr)
-        cmd = ["node", DI_CLI, *passthrough, "--frames", str(total_frames)]
-        if want_json:
-            cmd.append("--json")
-        os.execvp("node", cmd)  # replace process; preserves exit code / streaming
-        return 0  # unreachable
+        return EX_TEMPFAIL
 
     # One or more live slots -> CLAIM a lease per slot, shard, run concurrently under
     # the per-shard renew monitor (BC1-A in-flight abort), fail over, merge. Leasing

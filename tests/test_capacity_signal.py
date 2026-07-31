@@ -25,8 +25,9 @@ import heartbeat_all as ha
 # Recording fakes (no real DB).
 # --------------------------------------------------------------------------- #
 class _Cur:
-    def __init__(self, rows=()):
+    def __init__(self, rows=(), rowcount=1):
         self._rows = list(rows)
+        self.rowcount = rowcount
 
     def fetchone(self):
         return self._rows[0] if self._rows else None
@@ -50,6 +51,19 @@ class RecordingConn:
 
     def rollback(self):
         pass
+
+
+class RejectedHeartbeatConn(RecordingConn):
+    def __init__(self):
+        super().__init__()
+        self.rolled_back = False
+
+    def execute(self, sql, params=None):
+        self.calls.append((sql, params or {}))
+        return _Cur(rowcount=0 if sql == hb.UPSERT else 1)
+
+    def rollback(self):
+        self.rolled_back = True
 
 
 class CallSpy:
@@ -260,3 +274,23 @@ def test_none_probe_yields_well_formed_row(monkeypatch):
     out = hb.heartbeat_once(conn, args)         # must NOT raise
     assert out["alive"] is False and out["probe_ms"] is None
     assert hb.CAPACITY_UPSERT in [s for s, _ in conn.calls]
+
+
+def test_rejected_boot_epoch_tick_is_reported_and_does_not_refresh_capacity(monkeypatch):
+    monkeypatch.setattr(hb, "gpu_stats", lambda cmd, *a, **k: _stats())
+    monkeypatch.setattr(hb, "discover_served_model", lambda *a, **k: "m")
+    monkeypatch.setattr(hb, "decode_probe", lambda *a, **k: (True, 7, None))
+    monkeypatch.setattr(hb, "next_boot_epoch", lambda: 100)
+    args = types.SimpleNamespace(
+        node="n", endpoint="http://n:8081/v1", slot_id=0, gpu_cmd="nvidia-smi",
+        served_model="m", probe_model="m", nvlink_domain=None, max_context=8192,
+        latency_class="batch", free_slots=1, min_load_vram_mib=None, epoch=0,
+        timeout=5.0, push=True)
+    conn = RejectedHeartbeatConn()
+
+    out = hb.heartbeat_once(conn, args)
+
+    assert out["alive"] is False
+    assert "boot_epoch ratchet" in out["note"]
+    assert conn.rolled_back is True
+    assert hb.CAPACITY_UPSERT not in [sql for sql, _ in conn.calls]

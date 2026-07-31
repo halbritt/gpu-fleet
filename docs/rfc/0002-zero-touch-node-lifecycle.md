@@ -1,6 +1,7 @@
 # RFC 0002 — Zero-touch node lifecycle
 
-- **Status:** Draft (design) — ready for striatum design→build→verify
+- **Status:** Core shipped (migration 009 and heartbeat/puller code); per-node
+  RLS roles and a second deployed puller remain unshipped
 - **Backlog:** gpu-fleet README "Next" — *"each node self-heartbeats (kills the
   proximal SSH-driver SPOF)"* + *"node self-register on boot"*
 - **Composes with:** RFC-0001 (leases), RFC-0003 (epoch), #2 load-aware liveness
@@ -86,9 +87,9 @@ into the peer-runnable form below — see Traps.
 - A new slot enters **`status='unverified'`** (zero routable weight) and graduates
   `unverified → probationary → routable` only after **N consecutive DB-stamped
   passing decode-probes** (a `probe_streak` counter the UPSERT increments on
-  `alive`, zeroes on failure); it is **demoted** back the instant the streak
-  breaks. So "booted but GPU not ready" and a "lying node" both sit harmlessly
-  unverified.
+  `alive`, zeroes on failure). A failed probe moves a routable slot back to
+  `probationary`; a failed probe on any other slot keeps it `unverified`. So
+  "booted but GPU not ready" and a "lying node" both stay unroutable.
 - **Declared** (from `fleet_nodes`: `served_model`, `latency_class`,
   `max_context` ceiling, `nvlink_domain`) is separated from **measured** (the
   probe writes: `gpu_uuid`, `vram_free_mib`, `probe_ms`→tokens/sec, the real
@@ -177,10 +178,10 @@ recommendation is **peecee stays pull-only**.)
    prove parity before touching the `ollama-ondemand`/`gpu-only` branches or
    retiring any SSH. *(Or skip `pg_cron` entirely and go straight to the
    peer-runnable external puller — recommended.)*
-2. **Migration 006:** add `status` (CHECK in unverified/probationary/routable/
-   demoted, default unverified), `probe_streak INT DEFAULT 0`, `gpu_uuid TEXT`,
-   `boot_epoch BIGINT`; add `driven_by`/`lease_until` to `fleet_nodes`; redefine
-   `live_slots` → `routable_slots`. Columns-only, backward-compatible.
+2. **Migration 009:** add `status` (CHECK in
+   unverified/probationary/routable, default unverified),
+   `probe_streak INT DEFAULT 0`, `gpu_uuid TEXT`, `boot_epoch BIGINT`; add
+   `driven_by`/`lease_until` to `fleet_nodes`; define `routable_slots`.
 2. **heartbeat:** capture `gpu_uuid` (`nvidia-smi --query-gpu=uuid` on push nodes /
    endpoint-reported on pull); increment/reset `probe_streak`; promote/demote
    `status`; stamp `boot_epoch`; honor the per-node driver-lease.

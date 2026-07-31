@@ -1,8 +1,9 @@
 # RFC 0005 — Exporter-fed capacity signal (probe-anchored)
 
-- **Status:** Draft (design) — ready for striatum design→build→verify
-- **Backlog:** README "Next" — *"richer capacity signal from the nvidia exporter
-  (VRAM/util/topology) feeding the same rows"*
+- **Status:** Core shipped (migration 010, writer/readers, freshness decay, and
+  hermetic/guarded gates); production exporter/per-PID adapters and synthetic
+  phantom leases are not shipped
+- **Backlog:** production telemetry adapters remain deferred
 - **Composes with:** the v2 spine — exclusive leases (RFC 0001), epoch fencing
   (RFC 0003), zero-touch lifecycle (RFC 0002), and the load-aware
   `ollama-ondemand` liveness. No new hardware required.
