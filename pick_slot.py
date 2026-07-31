@@ -67,7 +67,7 @@ LEFT JOIN gpu_slots_capacity c
 LEFT JOIN model_capacity mc ON mc.model = gpu_slots.served_model
 CROSS JOIN (SELECT decay_k, fast_half_life_s FROM capacity_policy WHERE id = 1) cp
 WHERE alive
-  AND heartbeat_ts > now() - interval '45 seconds'
+  AND gpu_slot_is_fresh(heartbeat_ts)
   AND status = 'routable'                              -- RFC 0002: route only MEASURED-verified slots
   AND (lease_id IS NULL OR now() >= lease_expires)
   AND (%(latency_class)s::text IS NULL OR latency_class = %(latency_class)s::text)

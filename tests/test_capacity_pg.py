@@ -6,8 +6,8 @@ companion row, migration 010 re-applies idempotently with a singleton policy, an
 policy/model joins never multiply a slot row.
 
 These also prove the REAL migrations apply cleanly: the fixture runs migrations/001, 002,
-007, 008, 009, 010 in order against the ephemeral cluster (so it also proves 010 lands on
-the real schema the revised UPSERT targets).
+007, 008, 009, 010, and 014 in order against the ephemeral cluster (so it also proves the
+schema-integrity migration lands on the real schema the revised UPSERT targets).
 
 GUARDED exactly like test_epoch_pg.py so the default `pytest tests/ -q` stays green and
 hermetic:
@@ -42,7 +42,7 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _MIGRATIONS = os.path.join(_ROOT, "migrations")
 _FILES = ("001_gpu_slots.sql", "002_fleet_nodes.sql", "007_exclusive_slot_leases.sql",
           "008_lease_epoch.sql", "009_zero_touch_lifecycle.sql",
-          "010_exporter_capacity_signal.sql")
+          "010_exporter_capacity_signal.sql", "014_schema_integrity.sql")
 
 NODE, URL, SLOT_ID = "t", "http://t:8081/v1", 0
 SLOT = {"node": NODE, "endpoint_url": URL, "slot_id": SLOT_ID}
@@ -65,6 +65,12 @@ def _apply_migrations(conn):
 
 def _apply_010(conn):
     with open(os.path.join(_MIGRATIONS, "010_exporter_capacity_signal.sql"),
+              encoding="utf-8") as f:
+        conn.execute(f.read())
+
+
+def _apply_014(conn):
+    with open(os.path.join(_MIGRATIONS, "014_schema_integrity.sql"),
               encoding="utf-8") as f:
         conn.execute(f.read())
 
@@ -432,3 +438,9 @@ def test_010_reapply_singleton_and_view_cardinality(db):
         "SELECT count(*) FROM capacity_slots WHERE (node, endpoint_url, slot_id) = (%s,%s,%s)",
         (NODE, URL, SLOT_ID)).fetchone()[0]
     assert n == 1, "capacity_slots must be one row per slot even with the companion empty"
+
+
+def test_014_reapplies_idempotently(db):
+    conn = db()
+    _apply_014(conn)
+    assert conn.execute("SELECT gpu_fleet_heartbeat_ttl()").fetchone()[0].total_seconds() == 45

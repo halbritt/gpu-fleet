@@ -206,9 +206,15 @@ def probe_all(nodes: list[dict], probe_fn=None, max_workers: int | None = None) 
 
 
 PRUNE = """
-DELETE FROM gpu_slots
-WHERE (node, slot_id) NOT IN (SELECT node, slot_id FROM fleet_nodes WHERE enabled)
-  AND heartbeat_ts <= now() - interval '45 seconds'
+DELETE FROM gpu_slots AS slot
+WHERE NOT EXISTS (
+        SELECT 1
+        FROM fleet_nodes AS declared
+        WHERE declared.enabled
+          AND (declared.node, declared.endpoint_url, declared.slot_id)
+              = (slot.node, slot.endpoint_url, slot.slot_id)
+      )
+  AND NOT gpu_slot_is_fresh(slot.heartbeat_ts)
 """
 # RFC 0002 Slice 1 Change C (C3-PRUNE): delete only rows that are BOTH absent from
 # enabled fleet_nodes AND already stale. A self-pushed node with no fleet_nodes row

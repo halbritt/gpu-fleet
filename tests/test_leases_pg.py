@@ -38,6 +38,18 @@ SLOT2 = {"node": "t", "endpoint_url": "http://t2:8081/v1", "slot_id": 1}
 _DDL = """
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 DROP TABLE IF EXISTS gpu_slots;
+CREATE OR REPLACE FUNCTION gpu_fleet_heartbeat_ttl()
+RETURNS INTERVAL
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+AS $$ SELECT interval '45 seconds' $$;
+CREATE OR REPLACE FUNCTION gpu_slot_is_fresh(observed_at TIMESTAMPTZ)
+RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+PARALLEL SAFE
+AS $$ SELECT observed_at > now() - gpu_fleet_heartbeat_ttl() $$;
 CREATE TABLE gpu_slots (
     node          TEXT NOT NULL,
     endpoint_url  TEXT NOT NULL,

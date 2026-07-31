@@ -20,8 +20,9 @@ GRAD = heartbeat.GRADUATION_STREAK  # 3
 # A faithful in-memory model of the REAL heartbeat.UPSERT.
 # --------------------------------------------------------------------------- #
 class _Cur:
-    def __init__(self, rows):
+    def __init__(self, rows, rowcount=1):
         self._rows = rows
+        self.rowcount = rowcount
 
     def fetchone(self):
         return self._rows[0] if self._rows else None

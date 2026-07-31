@@ -6,8 +6,8 @@ survival across a reboot. Every assertion runs the REAL SQL constants (heartbeat
 NODE_LEASE_CAS, heartbeat_all.FETCH/PRUNE/PULLER_LEASE_CAS, di_fleet.LEASE_CLAIM_SQL)
 against the REAL migrations — so a column-name / predicate divergence fails the suite.
 
-These also prove the real migrations apply cleanly: the fixture runs migrations/001,
-002, 007, 008, 009 in order against an ephemeral cluster.
+These also prove the full real migration chain applies cleanly in order against
+an ephemeral cluster.
 
 GUARDED exactly like test_leases_pg.py / test_epoch_pg.py so the default
 `pytest tests/ -q` stays green and hermetic:
@@ -41,6 +41,8 @@ if _dbnames and any(n == "gpu_fleet" or "test" not in n for n in _dbnames):
 import di_fleet as leases  # noqa: E402  lease lifecycle lives in di_fleet (CLAIM_LEDGER)
 import heartbeat  # noqa: E402  the real UPSERT + push entry path + NODE_LEASE_CAS
 import heartbeat_all  # noqa: E402  the real FETCH / PRUNE / puller-lease CAS
+import pick_slot  # noqa: E402  the real freshness-gated picker
+import whisper_lease  # noqa: E402  standing-holder freshness classification
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _MIGRATIONS = os.path.join(_ROOT, "migrations")
@@ -164,6 +166,122 @@ def test_self_push_no_fleet_node_registers_and_graduates(db, monkeypatch):
     # the stale-only PRUNE must NOT delete a FRESH self-push row absent from fleet_nodes.
     conn.execute(heartbeat_all.PRUNE)
     assert _row(conn, "ghost") is not None, "PRUNE deleted a fresh self-push row (C3-PRUNE)"
+
+
+def test_rejected_push_rolls_back_driver_lease_and_skips_capacity(db, monkeypatch):
+    setup = db()
+    setup.execute(
+        "INSERT INTO fleet_nodes (node, slot_id, endpoint_url, served_model) "
+        "VALUES (%s, %s, %s, 'm')", (NODE, SLOT_ID, URL))
+    _stub_probes(monkeypatch)
+    args = _push_args(NODE, URL)
+
+    monkeypatch.setattr(heartbeat, "next_boot_epoch", lambda: 100)
+    with psycopg.connect(TEST_DB) as writer:
+        assert heartbeat.heartbeat_once(writer, args)["alive"] is True
+
+    setup.execute(
+        "UPDATE fleet_nodes SET driven_by=NULL, lease_until=now() - interval '1 minute' "
+        "WHERE node=%s", (NODE,))
+    setup.execute(
+        "UPDATE gpu_slots_capacity SET updated_ts=now() - interval '1 minute' "
+        "WHERE node=%s", (NODE,))
+
+    monkeypatch.setattr(heartbeat, "next_boot_epoch", lambda: 99)
+    with psycopg.connect(TEST_DB) as stale_writer:
+        result = heartbeat.heartbeat_once(stale_writer, args)
+
+    assert result["alive"] is False
+    assert result["note"] == "heartbeat rejected by boot_epoch ratchet"
+    assert _boot_epoch(setup) == 100
+    assert setup.execute(
+        "SELECT driven_by IS NULL AND lease_until < now() FROM fleet_nodes WHERE node=%s",
+        (NODE,)).fetchone()[0] is True
+    assert setup.execute(
+        "SELECT updated_ts < now() - interval '30 seconds' "
+        "FROM gpu_slots_capacity WHERE node=%s", (NODE,)).fetchone()[0] is True
+
+
+def test_endpoint_turnover_prunes_stale_slot_and_capacity(db):
+    conn = db()
+    old_url = "http://turnover-old:8081/v1"
+    new_url = "http://turnover-new:8081/v1"
+    conn.execute(
+        "INSERT INTO fleet_nodes (node, slot_id, endpoint_url, served_model) "
+        "VALUES ('turnover', 0, %s, 'm')", (new_url,))
+    conn.execute(heartbeat.UPSERT, _hb_row(
+        node="turnover", endpoint=old_url, alive=False, note="old endpoint"))
+    conn.execute(
+        "UPDATE gpu_slots SET heartbeat_ts = now() - interval '2 minutes' "
+        "WHERE node='turnover' AND endpoint_url=%s", (old_url,))
+    conn.execute(
+        "INSERT INTO gpu_slots_capacity (node, endpoint_url, slot_id) "
+        "VALUES ('turnover', %s, 0)", (old_url,))
+
+    conn.execute(heartbeat_all.PRUNE)
+
+    assert conn.execute(
+        "SELECT 1 FROM gpu_slots WHERE node='turnover' AND endpoint_url=%s",
+        (old_url,)).fetchone() is None
+    assert conn.execute(
+        "SELECT 1 FROM gpu_slots_capacity WHERE node='turnover' AND endpoint_url=%s",
+        (old_url,)).fetchone() is None
+
+
+def test_partial_lease_tuple_is_rejected(db):
+    conn = db()
+    _upsert(conn)
+
+    with pytest.raises(psycopg.errors.CheckViolation):
+        conn.execute(
+            "UPDATE gpu_slots SET lease_holder='partial', "
+            "lease_expires=now() + interval '45 seconds' WHERE node=%s", (NODE,))
+
+
+def test_epoch_regression_is_rejected_at_commit(db):
+    setup = db()
+    _upsert(setup)
+    conn = psycopg.connect(TEST_DB)
+    try:
+        conn.execute("UPDATE gpu_slots SET epoch = epoch - 1 WHERE node=%s", (NODE,))
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def test_unreachable_demoted_status_is_rejected(db):
+    conn = db()
+    _upsert(conn)
+
+    with pytest.raises(psycopg.errors.CheckViolation):
+        conn.execute("UPDATE gpu_slots SET status='demoted' WHERE node=%s", (NODE,))
+
+
+def test_freshness_policy_is_one_database_contract(db):
+    conn = db()
+    _upsert(conn)
+    conn.execute(
+        "UPDATE gpu_slots SET status='routable', "
+        "heartbeat_ts=now() - interval '50 seconds' WHERE node=%s", (NODE,))
+    assert _in_routable(conn) is False
+
+    conn.execute("""
+        CREATE OR REPLACE FUNCTION gpu_fleet_heartbeat_ttl()
+        RETURNS interval LANGUAGE sql IMMUTABLE PARALLEL SAFE
+        AS 'SELECT interval ''60 seconds'''
+    """)
+    assert _in_routable(conn) is True
+
+    for sql in (
+        heartbeat_all.PRUNE,
+        leases.LEASE_CLAIM_SQL,
+        leases.LEASE_RENEW_SQL,
+        pick_slot.PICK,
+        whisper_lease.SLOT_ROW_SQL,
+    ):
+        assert "gpu_slot_is_fresh" in sql
+        assert "interval '45 seconds'" not in sql
 
 
 # --------------------------------------------------------------------------- #

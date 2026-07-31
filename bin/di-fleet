@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # di-fleet: fan `di` (divergent-ideation) across N live fleet LLM slots.
 # Thin wrapper — all routing/shard/merge/failover logic lives in di_fleet.py so it
-# is importable + unit-testable. With no live slot it still works via di defaults
-# (the Python module handles that fallback). The stderr routing line stays visible.
+# is importable + unit-testable. With no claimable slot it exits 75 instead of
+# bypassing the fleet lease. The stderr routing line stays visible.
 set -uo pipefail
 FLEET=/home/halbritt/git/gpu-fleet
 exec python3 "$FLEET/di_fleet.py" "$@"

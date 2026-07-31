@@ -5,7 +5,7 @@ endpoint-turnover freshness term fences a held lease whose row stopped being the
 heartbeated endpoint.
 
 These also prove the REAL migrations apply cleanly: the fixture builds gpu_slots by
-running migrations/001, 007, 008 in order against the ephemeral cluster.
+running the schema migrations through 014 against the ephemeral cluster.
 
 GUARDED exactly like test_leases_pg.py so the default `pytest tests/ -q` stays green
 and hermetic:
@@ -51,7 +51,7 @@ _FILES = ("001_gpu_slots.sql", "002_fleet_nodes.sql", "007_exclusive_slot_leases
           # RFC 0005: 010 adds mig_mode/ecc_mode (the revised UPSERT writes them) +
           # the companion/policy/model tables + capacity_slots view. Applying it proves
           # 010 lands cleanly on the real schema the UPSERT now targets.
-          "010_exporter_capacity_signal.sql")
+          "010_exporter_capacity_signal.sql", "014_schema_integrity.sql")
 
 NODE, URL, SLOT_ID = "t", "http://t:8081/v1", 0
 SLOT = {"node": NODE, "endpoint_url": URL, "slot_id": SLOT_ID}
