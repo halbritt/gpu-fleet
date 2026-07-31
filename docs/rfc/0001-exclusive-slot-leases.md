@@ -1,6 +1,6 @@
 # RFC 0001 — Exclusive slot leases
 
-- **Status:** Draft (design) — ready for striatum design→build→verify
+- **Status:** Shipped (migration 007 and lease-enabled consumers)
 - **Backlog:** gpu-fleet v2 #4 (the prereq for exclusive K-fan-out)
 - **Supersedes:** advisory `FOR UPDATE SKIP LOCKED` claims
 - **Prepared via:** `/adhd` (5 isolated frames × 6 ideas, 3 deepened pillars)

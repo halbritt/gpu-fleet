@@ -1,6 +1,6 @@
 # RFC 0003 — Stale-router epoch fencing
 
-- **Status:** Draft (design) — small; rides on RFC-0001's lease mechanism
+- **Status:** Shipped (migration 008, heartbeat epoch bump, and renew fence)
 - **Backlog:** gpu-fleet README "Next" — *"`epoch`-stamped backend-side reject for stale routers"*
 - **Depends on:** RFC-0001 (leases) for the renew-fence hook
 - **Prepared via:** authored directly — this is a near-canonical extension of the
